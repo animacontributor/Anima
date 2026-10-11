@@ -41,6 +41,86 @@ class Speech:
 
 
 class VoiceTests(unittest.TestCase):
+    def test_parking_restores_same_cuda_recognizer_and_precision(self):
+        native = SimpleNamespace(unload_model=Mock(), load_model=Mock())
+        recognizer = SimpleNamespace(model=native)
+        key = ("large-v3-turbo", "cuda", "float16")
+        request = {"stt_model": key[0], "stt_device": key[1], "park_stt": True}
+        with patch.object(voice_worker, "_stt", recognizer), \
+             patch.object(voice_worker, "_stt_key", key), \
+             patch.object(voice_worker, "_stt_parked", False), \
+             patch.object(voice_worker, "_stt_warmed", True):
+            voice_worker.park_recognizer(request)
+            voice_worker.park_recognizer(request)
+            native.unload_model.assert_called_once_with(to_cpu=True)
+            self.assertTrue(voice_worker._stt_parked)
+            voice_worker.models(request, speech=False)
+            native.load_model.assert_called_once_with()
+            self.assertIs(voice_worker._stt, recognizer)
+            self.assertEqual(voice_worker._stt_key, key)
+            self.assertFalse(voice_worker._stt_parked)
+            self.assertTrue(voice_worker._stt_warmed)
+
+    def test_cpu_recognition_is_not_parked(self):
+        native = SimpleNamespace(unload_model=Mock(), load_model=Mock())
+        with patch.object(voice_worker, "_stt", SimpleNamespace(model=native)), \
+             patch.object(voice_worker, "_stt_key", ("large-v3-turbo", "cpu", "int8")), \
+             patch.object(voice_worker, "_stt_parked", False):
+            voice_worker.park_recognizer({"park_stt": True})
+            voice_worker.resume_recognizer()
+        native.unload_model.assert_not_called()
+        native.load_model.assert_not_called()
+
+    def test_cuda_parking_can_be_disabled(self):
+        native = SimpleNamespace(unload_model=Mock())
+        with patch.object(voice_worker, "_stt", SimpleNamespace(model=native)), \
+             patch.object(voice_worker, "_stt_key", ("large-v3-turbo", "cuda", "float16")), \
+             patch.object(voice_worker, "_stt_parked", False):
+            voice_worker.park_recognizer({"park_stt": False})
+        native.unload_model.assert_not_called()
+
+    def test_recognizer_parking_runs_before_cleanup_on_success_error_and_cancel(self):
+        for error in (None, RuntimeError("failed"), voice_worker.SpeechCancelled()):
+            calls = []
+            native = SimpleNamespace(unload_model=lambda **kwargs: calls.append("park"))
+            with patch.object(voice_worker, "_stt", SimpleNamespace(model=native)), \
+                 patch.object(voice_worker, "_stt_key", ("large-v3-turbo", "cuda", "float16")), \
+                 patch.object(voice_worker, "_stt_parked", False), \
+                 patch.object(voice_worker, "release_cuda_cache", side_effect=lambda: calls.append("cache")), \
+                 patch.object(voice_worker, "_handle", return_value={"text": "That is Squadron 42."}, side_effect=error):
+                if error:
+                    with self.assertRaises(type(error)):
+                        voice_worker.handle({"op": "transcribe", "park_stt": True})
+                else:
+                    self.assertEqual(voice_worker.handle({"op": "transcribe"})["text"], "That is Squadron 42.")
+            self.assertEqual(calls, ["park", "cache"])
+
+    def test_warmup_parks_recognition_before_speech_model_load(self):
+        calls = []
+        native = SimpleNamespace(unload_model=lambda **kwargs: calls.append("park"))
+        def transcribe(*args, **kwargs):
+            calls.append("recognition warmup")
+            return iter([]), None
+        with patch.object(voice_worker, "_stt", SimpleNamespace(model=native, transcribe=transcribe)), \
+             patch.object(voice_worker, "_stt_key", ("large-v3-turbo", "cuda", "float16")), \
+             patch.object(voice_worker, "_stt_parked", False), \
+             patch.object(voice_worker, "_stt_warmed", False), patch.object(voice_worker, "_warmed", False), \
+             patch.object(voice_worker, "models", side_effect=lambda req, speech=True: calls.append("speech load" if speech else "recognition load")), \
+             patch.object(voice_worker, "generate", side_effect=lambda *args: calls.append("speech warmup")), \
+             patch.object(voice_worker, "release_cuda_cache", side_effect=lambda: calls.append("cache")):
+            voice_worker.handle({"op": "warmup", "park_stt": True})
+        self.assertEqual(calls, ["recognition load", "recognition warmup", "park", "speech load", "speech warmup", "cache"])
+
+    def test_parking_failure_does_not_discard_completed_recognition(self):
+        native = SimpleNamespace(unload_model=Mock(side_effect=RuntimeError("device failure")))
+        with patch.object(voice_worker, "_stt", SimpleNamespace(model=native)), \
+             patch.object(voice_worker, "_stt_key", ("large-v3-turbo", "cuda", "float16")), \
+             patch.object(voice_worker, "_stt_parked", False), \
+             patch.object(voice_worker, "_handle", return_value={"text": "A statement."}), \
+             patch.object(voice_worker, "release_cuda_cache") as cleanup, patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(voice_worker.handle({"op": "transcribe"})["text"], "A statement.")
+        cleanup.assert_called_once()
+
     def test_voice_disabled_starts_no_worker_and_keeps_text_available(self):
         session = parlor.Session()
         with patch.object(config, "LIVE_VOICE_ENABLED", False), \

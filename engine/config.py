@@ -910,6 +910,9 @@ LIVE_VOICE_DEVICE = "cuda"     # Kyutai speech model; CPU is substantially slowe
 LIVE_VOICE_KYUTAI_STYLE = "calm"  # calm, desire, happy, neutral (released voices)
 LIVE_VOICE_STT_MODEL = "large-v3-turbo"
 LIVE_VOICE_STT_DEVICE = "cpu"   # cpu: int8; cuda: float16; GPU needs additional headroom
+# Park recognition weights in system RAM between utterances, then reload on
+# the same device/precision; frees GPU room for Gemma and speech generation.
+LIVE_VOICE_PARK_STT = True
 LIVE_VOICE_STT_BEAM_SIZE = 5
 LIVE_VOICE_STT_HINT = ""        # optional names/terms, e.g. "Squadron 42"
 LIVE_VOICE_LANGUAGE = "en"      # English or French for Kyutai; empty: recognizer auto-detect

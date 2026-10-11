@@ -64,9 +64,16 @@ written reply may not have been heard in full.
 
 ## Resources and privacy
 
-Speech models stay loaded in a separate worker during use. Unused PyTorch
+Speech models use a separate worker. With `LIVE_VOICE_PARK_STT = True`, CUDA
+recognition weights are kept in CPU storage between utterances and restored
+to their original GPU and precision for the next recognition. CPU recognition
+is unchanged. Warmup parks the recognizer before loading the speech model,
+reducing both steady GPU use and the initial loading peak. This adds a small
+weight-transfer cost; it does not switch GPU recognition to CPU/int8.
+
+Unused PyTorch
 CUDA allocator cache is released after warmup, recognition, synthesis,
-cancellation and failures; live model weights remain resident. Large Gemma
+cancellation and failures; speech-generation weights remain resident. Large Gemma
 context allocations plus GPU speech can still exceed the card's budget.
 Upstream's `EMBED_ON_CPU` setting can help leave room. These changes do not
 replace the memory store or change its embeddings.

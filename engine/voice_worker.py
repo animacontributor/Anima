@@ -22,6 +22,7 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 _tts = None
 _stt = None
 _stt_key = None
+_stt_parked = False
 _stt_warmed = False
 _warmed = False
 
@@ -31,10 +32,12 @@ class SpeechCancelled(Exception):
 
 
 def cuda_memory_stats() -> dict:
+    state = {"pid": os.getpid(), "recognizer_parked": _stt_parked,
+             "recognizer_device": _stt_key[1] if _stt_key else None}
     torch = sys.modules.get("torch")
     if torch is None or not torch.cuda.is_initialized():
-        return {"allocated_bytes": 0, "reserved_bytes": 0}
-    return {"allocated_bytes": int(torch.cuda.memory_allocated()),
+        return dict(state, allocated_bytes=0, reserved_bytes=0)
+    return {**state, "allocated_bytes": int(torch.cuda.memory_allocated()),
             "reserved_bytes": int(torch.cuda.memory_reserved())}
 
 
@@ -65,8 +68,30 @@ def check(req) -> dict:
     return {"installed": not missing, "missing": missing}
 
 
+
+def park_recognizer(req: dict) -> None:
+    """Keep CUDA recognition weights in CPU storage while the brain/voice runs.
+
+    Recognition still runs on its original device and precision after reload.
+    CTranslate2 owns this allocation; torch.empty_cache cannot release it.
+    """
+    global _stt_parked
+    native = getattr(_stt, "model", None)
+    if (req.get("park_stt", True) and _stt_key and _stt_key[1] == "cuda"
+            and native is not None and not _stt_parked):
+        native.unload_model(to_cpu=True)
+        _stt_parked = True
+
+
+def resume_recognizer() -> None:
+    global _stt_parked
+    if _stt_parked:
+        _stt.model.load_model()
+        _stt_parked = False
+
+
 def models(req: dict, speech=True):
-    global _tts, _stt, _stt_key, _stt_warmed
+    global _tts, _stt, _stt_key, _stt_warmed, _stt_parked
     name = req.get("stt_model") or "large-v3-turbo"
     stt_device = req.get("stt_device") or "cpu"
     if stt_device not in ("cpu", "cuda"):
@@ -80,6 +105,11 @@ def models(req: dict, speech=True):
                             local_files_only=bool(req.get("offline")))
         _stt_key = stt_key
         _stt_warmed = False
+        _stt_parked = False
+    if speech:
+        park_recognizer(req)
+    else:
+        resume_recognizer()
     if speech and _tts is None:
         from kyutai_voice import KyutaiVoice
         _tts = KyutaiVoice(req.get("device") or "cuda", offline=bool(req.get("offline")))
@@ -92,6 +122,11 @@ def handle(req: dict, emit=None, cancel=None) -> dict:
         try:
             return _handle(req, emit=emit, cancel=cancel)
         finally:
+            try:
+                park_recognizer(req)
+            except RuntimeError as error:
+                # Residency cleanup must not replace a valid transcript or error.
+                print(f"Recognizer GPU parking failed: {error}", file=sys.stderr)
             release_cuda_cache()
     return _handle(req, emit=emit, cancel=cancel)
 
@@ -101,7 +136,7 @@ def _handle(req: dict, emit=None, cancel=None) -> dict:
     if req["op"] == "check":
         return check(req)
     if req["op"] == "warmup":
-        models(req)
+        models(req, speech=False)
         if not _stt_warmed:
             import numpy as np
             # Initialize recognition kernels before microphone capture starts.
@@ -112,6 +147,8 @@ def _handle(req: dict, emit=None, cancel=None) -> dict:
                                          max_new_tokens=1, condition_on_previous_text=False)
             list(segments)
             _stt_warmed = True
+        park_recognizer(req)
+        models(req)
         if not _warmed:
             # Pay first CUDA/kernel and watermark initialization before
             # listening, instead of adding it to the first spoken reply.

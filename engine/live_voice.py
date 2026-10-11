@@ -121,6 +121,7 @@ class Worker:
                        "stt_model": getattr(config, "LIVE_VOICE_STT_MODEL", "large-v3-turbo"),
                        "stt_device": getattr(config, "LIVE_VOICE_STT_DEVICE", "cpu"),
                        "stt_beam_size": getattr(config, "LIVE_VOICE_STT_BEAM_SIZE", 5),
+                       "park_stt": bool(getattr(config, "LIVE_VOICE_PARK_STT", True)),
                        "language": getattr(config, "LIVE_VOICE_LANGUAGE", "en"),
                        "style": getattr(config, "LIVE_VOICE_KYUTAI_STYLE", "calm"),
                        "offline": bool(getattr(config, "OFFLINE", False)),
