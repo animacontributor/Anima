@@ -75,7 +75,9 @@ class PairingTests(unittest.TestCase):
 
 class ApiTests(unittest.TestCase):
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory();self.root=Path(self.temp.name)
+        self.temp=tempfile.TemporaryDirectory()
+        # Temp folders can have symlink or short-name aliases on macOS/Windows.
+        self.root=Path(self.temp.name).resolve()
         self.patches=[]
         values={'ROOT':self.root,'MEMORY_DIR':self.root/'memory','EPISODIC_DIR':self.root/'memory/episodic',
                 'SHARED_DIR':self.root/'shared','CREATIONS_DIR':self.root/'creations','LIVE_VOICE_BACKEND':'kyutai','AFTERGLOW':False}
