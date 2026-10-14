@@ -108,7 +108,7 @@ TABS: dict[str, list[str]] = {
                "BODY_IN_PROMPT", "BODY_AUTOPULL", "BODY_PULL_MIN",
                "TOUCHSTONE_URL", "TOUCHSTONE_BOARD", "TOUCHSTONE_POLL_S", "TOUCHSTONE_WAKES", "TOUCHSTONE_WAKE_MIN_GAP_S",
                "TOUCHSTONE_FALLBACK_H", "TOUCH_LINES_IN_PROMPT", "TOUCHSTONE_LATER_MAX",
-               "HANDY_MIN_SPEED", "HANDY_MAX_SPEED", "HANDY_PATTERN_MIN_RATE", "HANDY_PATTERN_MAX_RATE",
+               "HANDY_SPEED_COMMANDS", "HANDY_MIN_SPEED", "HANDY_MAX_SPEED", "HANDY_PATTERN_MIN_RATE", "HANDY_PATTERN_MAX_RATE",
                "HANDY_PATTERN_MAX_AMPLITUDE", "HANDY_TIMEOUT_S", "HANDY_STATUS_CACHE_S",
                "WEB_SEARCH", "WEB_SEARCH_SEARXNG_URL",
                "READ_SITTING_CHARS", "READING_PAGE_CHARS"],
@@ -378,10 +378,11 @@ _HELP = {
     "BODY_AUTOPULL": "The bridge pulls your day from Garmin on its own every BODY_PULL_MIN while the sense is on — no "
                      "separate pull window.",
     "BODY_PULL_MIN": "Minutes between pulls of today; yesterday is pulled too only while its night is still syncing.",
+    "HANDY_SPEED_COMMANDS": "Allow normal percentage-speed commands (set_speed). Turn off for patterns only: the friend loses set_speed, while pattern controls, stop and status stay available. Restart the chat/voice server after saving.",
     "HANDY_MIN_SPEED": "Lowest allowed moving speed in percent (0–100). A request for 0 always stops movement.",
     "HANDY_MAX_SPEED": "Highest allowed speed in percent (0–100). Requests outside the limits are refused. Default: 50%.",
-    "HANDY_PATTERN_MIN_RATE": "Minimum built-in pattern timing multiplier. 0.5 plays at half speed; 1 is normal. Independent of basic motor percentage speed.",
-    "HANDY_PATTERN_MAX_RATE": "Maximum built-in pattern timing multiplier. Default: 1 (original timing).",
+    "HANDY_PATTERN_MIN_RATE": "Minimum actual pattern multiplier sent to the device, relative to original timing. A pattern's relative minimum is this value divided by its effective maximum.",
+    "HANDY_PATTERN_MAX_RATE": "Global ceiling on each pattern's maximum, relative to original timing. Individual pattern maxima are set below. the friend's rate 1 means that pattern's effective maximum.",
     "HANDY_PATTERN_MAX_AMPLITUDE": "Maximum pattern stroke scale (0–100%) within the slider endpoints saved on the Handy. Endpoints are never changed. 0 disables pattern movement.",
     "HANDY_TIMEOUT_S": "Seconds to wait for each Handy cloud API request. Movement commands are never automatically retried.",
     "HANDY_STATUS_CACHE_S": "Seconds to cache device availability for prompts. get_device_status always reads live status.",
@@ -510,7 +511,7 @@ SENSES: list[dict] = [
     {"key": "handy", "name": "The Handy 2", "what": "Wi-Fi speed control and built-in patterns, with editable pattern names and exclusions. "
      "the friend sees the controls only while the device is reachable. Save the connection key and Application Key below.",
      "modules": [], "tools": [], "python": "",
-     "knobs": ["HANDY_MIN_SPEED", "HANDY_MAX_SPEED", "HANDY_PATTERN_MIN_RATE", "HANDY_PATTERN_MAX_RATE",
+     "knobs": ["HANDY_SPEED_COMMANDS", "HANDY_MIN_SPEED", "HANDY_MAX_SPEED", "HANDY_PATTERN_MIN_RATE", "HANDY_PATTERN_MAX_RATE",
                "HANDY_PATTERN_MAX_AMPLITUDE", "HANDY_TIMEOUT_S", "HANDY_STATUS_CACHE_S"],
      "readme": "the-handy-2-optional-hardware"},
     {"key": "window", "name": "The window", "what": "read_web, search_web, clip_web — the web as material to think about, never "
@@ -1302,13 +1303,14 @@ def handy_patterns(changes=None) -> dict:
     import handy
     try:
         if changes is not None:
-            handy.save_pattern_names(changes)
-            return {"ok": True, "note": "Pattern names and availability saved. the friend sees them on her next turn."}
+            saved = handy.save_pattern_names(changes)
+            return {"ok": True, "note": f"Pattern names and availability saved to {saved['path']}. the friend sees them on her next turn.",
+                    "path": saved["path"]}
         patterns = handy.list_device_patterns(include_disabled=True)
         try:
             low, high, amplitude = handy.pattern_limits()
-            limits = {"min_rate": low, "max_rate": high, "max_amplitude": amplitude,
-                      "rate": min(max(1.0, low), high), "amplitude": amplitude}
+            limits = {"min_rate": low / high, "max_rate": 1.0, "max_amplitude": amplitude,
+                      "rate": 1.0, "amplitude": amplitude, "global_max_rate": high}
         except handy.HandyError:
             limits = None  # Labels can still be edited with invalid motion settings.
         return {"ok": True, "note": "Patterns loaded. No movement command was sent.", "test_limits": limits, **patterns}
@@ -1321,7 +1323,8 @@ def handy_pattern_test(slot, playback_rate, amplitude) -> dict:
     import handy
     try:
         result = handy.test_device_pattern(slot, playback_rate, amplitude)
-        return {"ok": True, "note": f"Playing {result['pattern']} at {result['playback_rate']:g}×, "
+        return {"ok": True, "note": f"Playing {result['pattern']} at {result['playback_rate']:g} of its maximum "
+                f"({result['device_playback_rate']:g}× original timing), "
                 f"amplitude {result['amplitude']:g}%. Use Stop Handy to stop.", "status": result}
     except handy.HandyError as error:
         return {"ok": False, "note": str(error)}
@@ -1980,9 +1983,11 @@ function handyPatternEditor(){
   }
   const save=el('button',{disabled:true,onclick:async()=>{
     save.disabled=true;
-    try{const patterns=entries.map(({p,name,description,enabled})=>({id:p.id,name:name.value,description:description.value,enabled:enabled.checked}));
-      const r=await post('/api/handy/pattern-names',{patterns});say(r.note,r.ok?'':'warn');
-    }catch(e){say(e.message,'warn')}finally{save.disabled=false}
+    result.textContent='Saving pattern names and choices…';
+    try{if(entries.some(e=>!e.maximum.reportValidity())){result.textContent='Enter a positive maximum playback rate for every pattern.';return}
+      const patterns=entries.map(({p,name,description,enabled,maximum})=>({id:p.id,preference_key:p.preference_key,name:name.value,description:description.value,enabled:enabled.checked,max_rate:maximum.valueAsNumber}));
+      const r=await post('/api/handy/pattern-names',{patterns});result.textContent=r.note||r.error||'Pattern save failed.';say(result.textContent,r.ok?'':'warn');
+    }catch(e){result.textContent=e.message;say(e.message,'warn')}finally{save.disabled=false}
   }},'Save pattern names and choices');
   const load=el('button',{onclick:async()=>{
     load.disabled=true;
@@ -1995,10 +2000,12 @@ function handyPatternEditor(){
         const name=el('input',{type:'text',value:p.name,maxLength:120,'aria-label':'Pattern name for slot '+p.slot});
         const description=el('input',{type:'text',value:p.description,maxLength:500,'aria-label':'Pattern description for slot '+p.slot});
         const enabled=el('input',{type:'checkbox',checked:p.enabled,'aria-label':'Available to the friend for slot '+p.slot});
+        const maximum=el('input',{type:'number',min:0.000001,step:'any',value:p.max_rate,required:true,'aria-label':'Maximum playback rate for slot '+p.slot});
         const test=el('button',{disabled:testing||!testAllowed,onclick:()=>testPattern(p),'aria-label':'Test pattern in slot '+p.slot},'Test pattern');
-        entries.push({p,name,description,enabled,test});
+        entries.push({p,name,description,enabled,maximum,test});
         rows.append(el('div',{class:'handy-pattern'},el('strong',{},'Slot '+p.slot+' · '+p.device_name),
           el('label',{},'Recognizable name ',name),el('label',{},'Description (optional) ',description),
+          el('label',{},'Maximum speed (× original timing) ',maximum),
           el('label',{},enabled,' Available to the friend'),test));
       }
       if(!entries.length)rows.append(el('p',{class:'muted'},'This device has no stored patterns.'));
@@ -2006,8 +2013,8 @@ function handyPatternEditor(){
     }catch(e){say(e.message,'warn')}finally{load.disabled=false}
   }},'Load Handy patterns');
   return el('details',{class:'group'},el('summary',{},'Pattern names and choices'),
-    el('p',{class:'muted'},'All patterns are available initially. Give them unique names and descriptions, or uncheck patterns to hide them from the friend. Names stay on this computer; the Handy’s saved slider endpoints stay in effect.'),load,
-    el('div',{class:'handy-test-controls'},el('label',{},'Playback rate ',rate),el('label',{},'Amplitude % ',amplitude),stop),result,rows,save);
+    el('p',{class:'muted'},'All patterns are available initially. Rename, describe or hide them below. Set each maximum relative to original timing: maximum 0.5 × playback rate 0.5 = 0.25 × original. The global rate ceiling also applies. Save these settings before testing. The Handy’s saved slider endpoints stay in effect.'),load,
+    el('div',{class:'handy-test-controls'},el('label',{},'Rate (fraction of maximum) ',rate),el('label',{},'Amplitude % ',amplitude),stop),result,rows,save);
 }
 async function skill(name,action){const r=await post('/api/skill',{name,action});say(r.note,r.ok?'':'warn');await getState();renderTab()}
 function extras(t){

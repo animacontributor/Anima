@@ -22,9 +22,9 @@ from datetime import datetime, timezone
 import config
 
 API_URL = "https://www.handyfeeling.com/api/handy-rest/v3"
-REVISION = "hrpp-idle-stop-v5"
+REVISION = "hrpp-stop-and-slot-verification-v7"
 BASE_TOOL_NAMES = {"set_speed", "stop_device", "get_device_status"}
-PATTERN_TOOL_NAMES = {"list_device_patterns", "play_device_pattern", "set_pattern_playback_rate", "set_pattern_amplitude"}
+PATTERN_TOOL_NAMES = {"list_device_patterns", "play_device_pattern", "set_pattern_playback_rate"}
 TOOL_NAMES = BASE_TOOL_NAMES | PATTERN_TOOL_NAMES
 _lock = threading.RLock()
 _cached: dict | None = None
@@ -93,10 +93,16 @@ def _record_command(path: str, data: dict | None, result=None, error: str = "") 
     def fields(value):
         if not isinstance(value, dict):
             return "ok" if value == "ok" else {}
-        return {k: v for k, v in value.items()
-                if k in ("mode", "mode_session_id", "play_state", "velocity", "direction", "current_pattern_nr",
-                         "playback_rate", "playback_speed", "amplitude")
-                and type(v) in (int, float, bool) and math.isfinite(v)}
+        numeric = {k: v for k, v in value.items()
+                   if k in ("mode", "mode_session_id", "play_state", "velocity", "direction", "current_pattern_nr",
+                            "pattern_id", "pattern_slot", "playback_rate", "playback_speed", "amplitude")
+                   and type(v) in (int, float, bool) and math.isfinite(v)}
+        pattern = value.get("current_pattern")
+        if isinstance(pattern, dict):
+            for source, target in (("id", "pattern_id"), ("slot", "pattern_slot")):
+                if type(pattern.get(source)) is int:
+                    numeric[target] = pattern[source]
+        return numeric
     entry = {"at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
              "revision": REVISION, "pid": os.getpid(),
              "method": "GET" if data is None else "PUT",
@@ -220,14 +226,60 @@ def _pattern_settings() -> dict:
         if not isinstance(settings, dict) or not isinstance(settings.get("patterns"), dict):
             raise ValueError()
         for key, row in settings["patterns"].items():
-            if (not key.isdecimal() or not isinstance(row, dict) or not isinstance(row.get("name", ""), str)
-                    or not isinstance(row.get("description", ""), str) or type(row.get("enabled", True)) is not bool):
+            if (not _valid_pattern_key(key) or not isinstance(row, dict) or not isinstance(row.get("name", ""), str)
+                    or not isinstance(row.get("description", ""), str) or type(row.get("enabled", True)) is not bool
+                    or not _valid_max_rate(row.get("max_rate", 1.0))):
                 raise ValueError()
         return settings["patterns"]
     except FileNotFoundError:
         return {}
     except (OSError, ValueError):
         raise HandyError("pattern names/settings could not be read from memory/handy-patterns.json") from None
+
+
+def _valid_pattern_key(key):
+    return isinstance(key, str) and (key.isdecimal() or bool(re.fullmatch(r"slot:\d+", key))
+                                   or (key.startswith("name:") and 0 < len(key[5:]) <= 120))
+
+
+def _valid_max_rate(value):
+    return type(value) in (int, float) and math.isfinite(value) and value > 0
+
+
+def _pattern_key(pattern, catalog):
+    name = pattern["device_name"].strip().casefold()
+    if name and sum(p["device_name"].strip().casefold() == name for p in catalog) == 1:
+        return "name:" + name
+    return f"slot:{pattern['slot']}"
+
+
+def _pattern_preference(settings, pattern, catalog):
+    key = _pattern_key(pattern, catalog)
+    if key in settings:
+        return settings[key], key
+    legacy = str(pattern["id"])
+    if legacy in settings:
+        return settings[legacy], legacy
+    # Older files stored only aliases under firmware IDs. Factory names let
+    # us recover those entries after the IDs change without guessing slots.
+    name = pattern["device_name"].strip().casefold()
+    matches = [(row, old) for old, row in settings.items() if old.isdecimal() and name
+               and str(row.get("device_name") or row.get("name", "")).strip().casefold() == name]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise HandyError("multiple saved preferences match a device pattern; give it one saved preference")
+    return {}, None
+
+
+def _canonical_pattern_settings(settings, catalog):
+    canonical = dict(settings)
+    for pattern in catalog:
+        row, old = _pattern_preference(settings, pattern, catalog)
+        if old is not None:
+            canonical.pop(old, None)
+            canonical[_pattern_key(pattern, catalog)] = dict(row, device_name=pattern["device_name"], slot=pattern["slot"])
+    return canonical
 
 
 def _pattern_catalog(*, force=False) -> list[dict]:
@@ -268,14 +320,21 @@ def list_device_patterns(*, include_disabled=False, force=True) -> dict:
         preferences = _pattern_settings()
         patterns = _pattern_catalog(force=force)
         result = []
+        try:
+            low, high, _ = pattern_limits()
+        except HandyError:
+            low = high = None  # Keeper can edit labels/maxima while fixing global settings.
         for pattern in patterns:
-            saved = preferences.get(str(pattern["id"]), {})
+            saved, _ = _pattern_preference(preferences, pattern, patterns)
             if (not isinstance(saved, dict) or not isinstance(saved.get("name", ""), str)
                     or not isinstance(saved.get("description", ""), str) or type(saved.get("enabled", True)) is not bool):
                 raise HandyError("invalid pattern names/settings in memory/handy-patterns.json")
             name = saved.get("name", "").strip() or pattern["device_name"].strip() or f"Pattern {pattern['slot']}"
             pattern.update(name=name[:120], description=saved.get("description", "")[:500],
-                           enabled=saved.get("enabled", True), selector=f"slot:{pattern['slot']}")
+                           enabled=saved.get("enabled", True), selector=f"slot:{pattern['slot']}",
+                           preference_key=_pattern_key(pattern, patterns), max_rate=saved.get("max_rate", 1.0),
+                           effective_max_rate=min(saved.get("max_rate", 1.0), high) if high is not None else None,
+                           min_playback_rate=low / min(saved.get("max_rate", 1.0), high) if high is not None else None)
             if include_disabled or pattern["enabled"]:
                 result.append(pattern)
         return {"patterns": result}
@@ -287,17 +346,34 @@ def save_pattern_names(changes) -> dict:
         raise HandyError("expected a list of pattern names/settings")
     with _lock:
         settings = _pattern_settings()
+        # Loading the editor populates this read-only catalog. Saving remains
+        # a local operation, even if the device disconnects after loading.
+        catalog = _patterns_cache if isinstance(_patterns_cache, list) else []
+        settings = _canonical_pattern_settings(settings, catalog)
         changed_ids = set()
+        changed_keys = set()
         for row in changes:
             if (not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] < 0
                     or row["id"] in changed_ids or not isinstance(row.get("name"), str)
                     or not isinstance(row.get("description", ""), str) or type(row.get("enabled", True)) is not bool):
                 raise HandyError("each pattern needs a unique numeric id, a name, a description and an enabled flag")
             changed_ids.add(row["id"])
+            key = row.get("preference_key")
+            pattern = next((p for p in catalog if p["id"] == row["id"]), None)
+            if key is None:
+                key = _pattern_key(pattern, catalog) if pattern else str(row["id"])
+            if not _valid_pattern_key(key) or key in changed_keys:
+                raise HandyError("each pattern needs a unique saved preference key")
+            changed_keys.add(key)
+            maximum = row.get("max_rate", settings.get(key, {}).get("max_rate", 1.0))
+            if not _valid_max_rate(maximum):
+                raise HandyError("each pattern maximum playback rate must be a finite positive number")
             name, description = row["name"].strip(), row.get("description", "").strip()
             if len(name) > 120 or len(description) > 500 or any(ord(c) < 32 for c in name + description) or re.fullmatch(r"slot:\d+", name, re.I):
                 raise HandyError("use a short name (120 characters) and description (500), without control characters or slot selectors")
-            settings[str(row["id"])] = {"name": name, "description": description, "enabled": row.get("enabled", True)}
+            settings[key] = {"name": name, "description": description, "enabled": row.get("enabled", True), "max_rate": maximum}
+            if pattern:
+                settings[key].update(device_name=pattern["device_name"], slot=pattern["slot"])
         names = [row.get("name", "").strip().casefold() for row in settings.values()
                  if isinstance(row, dict) and row.get("enabled", True) and row.get("name", "").strip()]
         if len(names) != len(set(names)):
@@ -307,9 +383,11 @@ def save_pattern_names(changes) -> dict:
         try:
             tmp.write_text(json.dumps({"patterns": settings}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             os.replace(tmp, path)
+            if _pattern_settings() != settings:
+                raise HandyError("saved pattern preferences could not be verified")
         except OSError:
             raise HandyError("pattern names/settings could not be saved") from None
-        return {"saved": True}
+        return {"saved": True, "path": str(path.resolve()), "patterns": settings}
 
 
 def _hrpp_state(state) -> dict:
@@ -325,7 +403,10 @@ def _hrpp_state(state) -> dict:
     pattern_id, slot = current.get("id", state.get("current_pattern_nr")), current.get("slot")
     if any(value is not None and (type(value) is not int or value < 0) for value in (pattern_id, slot)):
         raise HandyError("API returned invalid active pattern identifiers")
-    return {"running": state["play_state"] == 2, "pattern_id": pattern_id,
+    name = current.get("name")
+    if name is not None and not isinstance(name, str):
+        raise HandyError("API returned invalid active pattern name")
+    return {"running": state["play_state"] == 2, "pattern_id": pattern_id, "pattern_device_name": name,
             "pattern_slot": slot, "playback_rate": rate, "amplitude": round(amplitude * 100, 4)}
 
 
@@ -339,6 +420,40 @@ def _validate_pattern_values(rate=None, amplitude=None):
         raise HandyError(f"pattern amplitude must be an integer from 0 to {cap}% within the device's saved endpoints")
 
 
+def _validate_relative_rate(rate):
+    if type(rate) not in (int, float) or not math.isfinite(rate) or not 0 < rate <= 1:
+        raise HandyError("playback rate must be a number above 0 and at most 1, relative to the pattern's configured maximum")
+
+
+def _device_pattern_rate(rate, pattern):
+    _validate_relative_rate(rate)
+    low, high, _ = pattern_limits()
+    maximum = min(pattern["max_rate"], high)
+    actual = rate * maximum
+    if math.isclose(actual, low, rel_tol=1e-9, abs_tol=1e-12):
+        actual = low
+    if actual < low:
+        raise HandyError(f"this pattern requires playback_rate >= {low / maximum:g} to respect the configured minimum device rate {low:g}")
+    _validate_pattern_values(actual)
+    return actual
+
+
+def _reported_pattern_state(state, pattern):
+    maximum = min(pattern["max_rate"], pattern_limits()[1])
+    return dict(state, device_playback_rate=state["playback_rate"],
+                playback_rate=state["playback_rate"] / maximum,
+                max_rate=pattern["max_rate"], effective_max_rate=maximum, pattern=pattern["name"])
+
+
+def _current_pattern(status):
+    patterns = list_device_patterns(include_disabled=True, force=False)["patterns"]
+    matches = [p for p in patterns if (p["slot"] == status.get("pattern_slot") if status.get("pattern_slot") is not None
+                                     else p["id"] == status.get("pattern_id"))]
+    if len(matches) != 1:
+        raise HandyError("active pattern could not be identified; select a pattern first")
+    return matches[0]
+
+
 def _pattern_failure(error):
     try:
         stop_device()
@@ -347,8 +462,9 @@ def _pattern_failure(error):
     raise HandyError(f"{error}; device was stopped") from None
 
 
-def play_device_pattern(pattern: str, playback_rate: float = 1.0, amplitude: int = 100) -> dict:
-    return _play_device_pattern(pattern, playback_rate, amplitude, include_disabled=False)
+def play_device_pattern(pattern: str, playback_rate: float = 1.0) -> dict:
+    """the friend's playback always uses the full existing device stroke envelope."""
+    return _play_device_pattern(pattern, playback_rate, 100, include_disabled=False)
 
 
 def test_device_pattern(slot: int, playback_rate: float = 1.0, amplitude: int = 100) -> dict:
@@ -363,7 +479,8 @@ def _play_device_pattern(pattern: str, playback_rate: float, amplitude: int, *, 
         raise HandyError("choose a pattern name or slot selector returned by list_device_patterns")
     if type(playback_rate) not in (int, float) or type(amplitude) is not int:
         raise HandyError("pattern playback rate must be a number and amplitude an integer percentage")
-    _validate_pattern_values(playback_rate, amplitude)
+    _validate_relative_rate(playback_rate)
+    _validate_pattern_values(amplitude=amplitude)
     with _lock:
         status = get_device_status()
         if not status["available"]:
@@ -373,50 +490,61 @@ def _play_device_pattern(pattern: str, playback_rate: float, amplitude: int, *, 
         if len(matches) != 1:
             raise HandyError("pattern is unknown, disabled or ambiguous; use list_device_patterns to choose an exact name or slot selector")
         selected = matches[0]
+        device_rate = _device_pattern_rate(playback_rate, selected)
         try:
-            # Idle is the reliable protocol-independent stop. Handy 2 FW4.3
-            # returns HTTP 500 for /hrpp/stop even when already stopped.
+            # Use the same stop as the keeper's Stop Handy button for EVERY
+            # selection. Idle stops all protocols before HRPP is initialized.
             # Neither slider endpoints nor stroke boundaries are written.
-            if status["mode"] != 9 or status["running"] is not False:
-                if status["mode"] != 7:
-                    _set_mode(7)
-                _set_mode(9)
+            stop_device()
+            _set_mode(9)
             stopped = _hrpp_state(_request("/hrpp/state"))
             if stopped["running"]:
                 raise HandyError("pattern stop was not confirmed")
             state = _hrpp_state(_request(f"/hrpp/patterns/{selected['slot']}/activate", {}))
             if state["running"]:
                 raise HandyError("pattern activation unexpectedly started playback")
-            _hrpp_state(_request("/hrpp/playbackrate", {"playback_rate": playback_rate}))
+            _hrpp_state(_request("/hrpp/playbackrate", {"playback_rate": device_rate}))
             _hrpp_state(_request("/hrpp/amplitude", {"amplitude": amplitude / 100}))
             _hrpp_state(_request("/hrpp/start", {}))
             for _ in range(3):
                 state = _hrpp_state(_request("/hrpp/state"))
                 if state["running"]:
                     break
-            if (not state["running"] or state["pattern_id"] != selected["id"]
-                    or not math.isclose(state["playback_rate"], playback_rate, rel_tol=1e-5, abs_tol=1e-5)
+            # Firmware IDs can change when HRPP is reinitialized. Slot and
+            # factory name identify the activated preset across that change.
+            if (not state["running"] or state["pattern_slot"] != selected["slot"]
+                    or (state["pattern_device_name"] is not None and
+                        state["pattern_device_name"].strip().casefold() != selected["device_name"].strip().casefold())
+                    or not math.isclose(state["playback_rate"], device_rate, rel_tol=1e-5, abs_tol=1e-5)
                     or not math.isclose(state["amplitude"], amplitude, abs_tol=.01)):
                 raise HandyError("requested pattern playback was not confirmed")
-            return dict(state, pattern=selected["name"])
+            return _reported_pattern_state(state, selected)
         except HandyError as error:
             _pattern_failure(error)
         finally:
             invalidate()
 
 
-def _adjust_pattern(path, value, *, rate=None, amplitude=None):
-    _validate_pattern_values(rate, amplitude)
+def _adjust_pattern(path, value, *, rate=None, amplitude=None, fixed_amplitude=False, expected_slot=None):
+    _validate_pattern_values(rate, 100 if fixed_amplitude else amplitude)
     with _lock:
         status = get_device_status()
         if not status["available"] or status["mode"] != 9:
             raise HandyError("select a device pattern first; no movement command was sent")
+        if expected_slot is not None and status.get("pattern_slot") != expected_slot:
+            raise HandyError("active pattern changed; no movement command was sent")
         try:
             _hrpp_state(_request(path, value))
+            if fixed_amplitude and status.get("amplitude") != 100:
+                _hrpp_state(_request("/hrpp/amplitude", {"amplitude": 1.0}))
             state = _hrpp_state(_request("/hrpp/state"))
+            if expected_slot is not None and state.get("pattern_slot") != expected_slot:
+                raise HandyError("active pattern changed during the rate command")
             target, actual = (rate, state["playback_rate"]) if rate is not None else (amplitude, state["amplitude"])
             if not math.isclose(target, actual, rel_tol=1e-5, abs_tol=.01):
                 raise HandyError("requested pattern setting was not confirmed")
+            if fixed_amplitude and not math.isclose(state["amplitude"], 100, abs_tol=.01):
+                raise HandyError("fixed 100% pattern amplitude was not confirmed")
             return state
         except HandyError as error:
             _pattern_failure(error)
@@ -425,9 +553,17 @@ def _adjust_pattern(path, value, *, rate=None, amplitude=None):
 
 
 def set_pattern_playback_rate(playback_rate: float) -> dict:
-    if type(playback_rate) not in (int, float):
-        raise HandyError("pattern playback rate must be a finite number")
-    return _adjust_pattern("/hrpp/playbackrate", {"playback_rate": playback_rate}, rate=playback_rate)
+    _validate_relative_rate(playback_rate)
+    _validate_pattern_values(amplitude=100)
+    with _lock:
+        status = get_device_status()
+        if not status["available"] or status["mode"] != 9:
+            raise HandyError("select a device pattern first; no movement command was sent")
+        pattern = _current_pattern(status)
+        device_rate = _device_pattern_rate(playback_rate, pattern)
+        state = _adjust_pattern("/hrpp/playbackrate", {"playback_rate": device_rate}, rate=device_rate,
+                                fixed_amplitude=True, expected_slot=pattern["slot"])
+        return _reported_pattern_state(state, pattern)
 
 
 def set_pattern_amplitude(amplitude: int) -> dict:
@@ -477,6 +613,13 @@ def get_device_status(*, force: bool = True) -> dict:
                         status.update(running=False, speed=0)
                     elif mode["mode"] == 9:
                         status.update(_hrpp_state(_request("/hrpp/state")))
+                        status["device_playback_rate"] = status["playback_rate"]
+                        try:
+                            status.update(_reported_pattern_state(status, _current_pattern(status)))
+                        except HandyError:
+                            # Status remains read-only and useful if the catalog
+                            # is unavailable; label the raw device rate explicitly.
+                            status["relative_playback_rate_unavailable"] = True
             except HandyError as e:
                 status.update(available=False, error=str(e))
         _cached, _cache_key, _checked_at = dict(status), key, time.monotonic()
@@ -487,20 +630,27 @@ def available() -> bool:
     return get_device_status(force=False)["available"]
 
 
+def enabled_tool_names() -> set[str]:
+    return TOOL_NAMES if getattr(config, "HANDY_SPEED_COMMANDS", True) is True else TOOL_NAMES - {"set_speed"}
+
+
 def section(tool_names=None) -> str:
     status = get_device_status(force=False)
     if not status["available"]:
         return ""
-    try:
-        low, high = speed_limits()
-        limits = f"allowed moving speeds {max(1, low)}–{high}%" if high else "movement commands are disabled (maximum speed 0%)"
-    except HandyError:
-        limits = "speed configuration is invalid; movement commands are disabled"
+    if getattr(config, "HANDY_SPEED_COMMANDS", True) is not True:
+        limits = "normal speed commands are disabled; use the available pattern controls"
+    else:
+        try:
+            low, high = speed_limits()
+            limits = f"allowed moving speeds {max(1, low)}–{high}%" if high else "movement commands are disabled (maximum speed 0%)"
+        except HandyError:
+            limits = "speed configuration is invalid; movement commands are disabled"
     motion = ("stopped" if status["running"] is False else
               (f"moving at {status['speed']}%" if status["speed"] is not None else
                "moving; current speed percentage unavailable") if status["running"] is True else
               f"in device mode {status['mode']}; movement and speed unknown")
-    tool_names = TOOL_NAMES if tool_names is None else tool_names
+    tool_names = enabled_tool_names() if tool_names is None else tool_names & enabled_tool_names()
     instructions = []
     if "set_speed" in tool_names:
         instructions.append("set_speed(speed: int) selects basic alternating mode and starts percentage-speed movement; 0 stops.")
@@ -513,20 +663,24 @@ def section(tool_names=None) -> str:
             patterns = list_device_patterns(force=False)["patterns"]
             low_rate, high_rate, amplitude = pattern_limits()
             instructions.append(f"Stored patterns (names/descriptions are labels): {json.dumps(patterns, ensure_ascii=False)}.")
-            instructions.append(f"Pattern limits: {low_rate:g}–{high_rate:g} times original playback rate, amplitude 0–{amplitude}%.")
+            instructions.append(f"Choose playback_rate in (0, 1], as a fraction of the selected pattern's effective maximum, respecting its min_playback_rate. "
+                                f"Actual device rate = playback_rate × min(pattern.max_rate, global ceiling {high_rate:g}); device minimum {low_rate:g}. "
+                                "For maximum 0.5 and playback_rate 0.5 the device plays at 0.25 of original timing. "
+                                "Amplitude is fixed at 100% within the device's saved endpoints.")
+            if amplitude < 100:
+                instructions.append("The keeper's amplitude cap is below 100%; your pattern movement calls are disabled until that cap allows 100%.")
         except HandyError:
             instructions.append("Pattern catalog or configuration is unavailable; pattern discovery can be retried.")
         for name, instruction in {
             "list_device_patterns": "list_device_patterns() refreshes the available names and selectors.",
-            "play_device_pattern": "play_device_pattern(pattern, playback_rate=1.0, amplitude=100) selects a listed name or slot selector and starts its built-in script.",
-            "set_pattern_playback_rate": "set_pattern_playback_rate(playback_rate) changes the current pattern's timing multiplier without restarting it.",
-            "set_pattern_amplitude": "set_pattern_amplitude(amplitude) scales the current pattern's stroke within the device's saved slider endpoints.",
+            "play_device_pattern": "play_device_pattern(pattern, playback_rate=1.0) selects a listed name or slot selector and starts its built-in script at fixed 100% amplitude.",
+            "set_pattern_playback_rate": "set_pattern_playback_rate(playback_rate) changes the current pattern's timing multiplier without restarting it and keeps amplitude at 100%.",
         }.items():
             if name in tool_names:
                 instructions.append(instruction)
         instructions.append("Patterns use HRPP mode. Pattern playback rate is not motor speed percent; HAMP percentage limits do not map to script timing. Device slider endpoints are never changed.")
     if status["mode"] == 9:
-        motion = f"pattern mode; {'playing' if status['running'] else 'stopped/paused'}; playback rate {status['playback_rate']:g}; amplitude {status['amplitude']:g}%"
+        motion = f"pattern mode; {'playing' if status['running'] else 'stopped/paused'}; device playback rate {status['device_playback_rate']:g}× original timing; amplitude {status['amplitude']:g}%"
     return ("[engine: The Handy 2 is connected and available as of this turn; "
             f"{motion}; {limits}. " + " ".join(instructions) + " "
             "Limits are enforced by the engine; rejected calls do not change speed. "
@@ -556,6 +710,8 @@ def set_speed(speed: int) -> dict:
         raise HandyError("speed must be an integer percentage from 0 to 100")
     if speed == 0:
         return stop_device()
+    if getattr(config, "HANDY_SPEED_COMMANDS", True) is not True:
+        raise HandyError("normal speed commands are disabled in Handy settings; use a device pattern or stop_device")
     low, high = speed_limits()
     if not low <= speed <= high:
         raise HandyError(f"speed must be between {max(1, low)} and {high}%; 0 always stops")

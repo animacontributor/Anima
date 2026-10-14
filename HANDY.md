@@ -42,6 +42,14 @@ expire (one hour by default, at most 24 hours). The Application Key setup above
 handles this lifecycle automatically. See the [official token issuance
 endpoint](https://www.handyfeeling.com/api/handy-rest/v3/docs/#/AUTH/issueToken).
 
+For patterns only, turn **HANDY_SPEED_COMMANDS** off under **Settings → Senses →
+The Handy 2**, click **Save Senses**, and restart the running chat/voice server.
+This removes `set_speed` from the friend's tools and instructions and rejects any
+late nonzero speed call. Patterns, `stop_device`, status and panel testing stay
+available. The switch defaults to on for existing setups; speed 0 still stops
+if received from an older pending call. Keep `HANDY_MAX_SPEED` above 0, since
+setting that maximum to 0 disables all movement, including patterns.
+
 The callable tools are:
 
 - `set_speed(speed: int)`: Set percentage speed and start movement. The default
@@ -57,19 +65,23 @@ The callable tools are:
 - `list_device_patterns()`: Read all enabled built-in patterns, including their
   recognizable names, optional descriptions and `slot:N` selectors. This does
   not switch modes or move the device.
-- `play_device_pattern(pattern, playback_rate=1.0, amplitude=100)`: Select a
+- `play_device_pattern(pattern, playback_rate=1.0)`: Select a
   listed name or slot selector, switch to HRPP and play the stored pattern.
-  The default is the pattern's original timing and full amplitude within the
+  Playback rate is a fraction of that pattern's configured maximum: the default
+  `1` uses its maximum, with fixed 100% amplitude within the
   Handy's existing slider endpoints. The engine stops the previous pattern
   before changing it, then checks the active pattern and settings after start.
+  Every selection automatically calls the same stop as **Stop Handy**, enters
+  HRPP again, selects the preset and starts it. Verification uses its slot and
+  factory name; firmware IDs can change when HRPP is initialized and are not
+  used to decide whether the requested preset started correctly.
   Stopping uses idle mode rather than `/hrpp/stop`, which returns HTTP 500 on
   the tested Handy 2 firmware 4.3.0 even while already stopped.
 - `set_pattern_playback_rate(playback_rate)`: Change the current pattern's
-  timing multiplier without restarting playback. `1` is original timing;
-  `0.5` plays at half speed. This requires pattern mode.
-- `set_pattern_amplitude(amplitude)`: Scale the current pattern's stroke from
-  0–100% within the device's saved slider endpoints. Does not move those
-  endpoints, change modes or start playback.
+  rate without restarting playback. `1` uses its configured maximum;
+  `0.5` plays at half that maximum. This requires pattern mode and restores 100%
+  amplitude if a manual test or another controller changed it. the friend has no
+  amplitude tool or amplitude argument; saved slider endpoints remain in effect.
 
 ### Pattern names and choices
 
@@ -80,7 +92,14 @@ then click **Save pattern names and choices**. Uncheck **Available to the friend
 to exclude a pattern; excluded patterns cannot be selected through its slot
 selector either. Loading and saving this editor never start or stop movement.
 
-To try presets directly, set **Playback rate** and **Amplitude %** in this
+Each row also has **Maximum speed (× original timing)**. Set it to `0.5` to
+make that pattern's maximum half its original rate, then click **Save pattern
+names and choices**. the friend's `playback_rate` uses a relative scale from above
+0 to 1: maximum `0.5` × her selected rate `0.5` = actual device rate `0.25`.
+The same mapping applies to rate changes and panel tests. Different patterns
+can have different maxima. Missing maxima default to `1.0` for existing files.
+
+To try presets directly, set **Rate (fraction of maximum)** and **Amplitude %** in this
 editor and click **Test pattern** on any row. The test starts the physical
 Handy and continues until you click **Stop Handy** or select another pattern.
 The Stop control stays visible while scrolling through the patterns. Testing
@@ -89,15 +108,21 @@ Patterns excluded from the friend can still be tested here without enabling them
 No conversation, chat prompt or label save is needed to test a preset.
 
 Names and exclusions are saved in `memory/handy-patterns.json`, separate from
-credentials, keyed by pattern ID so names survive changes in slot order:
+credentials, keyed by the device's factory preset name. Numeric firmware IDs
+can change, so preferences follow the factory name through ID and slot changes.
+Unnamed or duplicate factory names use `slot:N` keys instead. Older numeric-ID
+entries with recognizable factory names are migrated on the next save:
 
 ```json
 {
   "patterns": {
-    "123": {"name": "Gentle waves", "description": "Your description", "enabled": true}
+    "name:factory_preset_name": {"name": "Gentle waves", "description": "Your description", "enabled": true, "max_rate": 0.5}
   }
 }
 ```
+
+The save result appears beside the pattern controls and shows the exact file
+path. A successful save is checked by reading the saved preferences back.
 
 The enabled names and descriptions appear in the friend's immediate device context.
 The catalog is cached for up to 60 seconds; the list tool and panel Load button
@@ -105,11 +130,21 @@ read it live. Local label edits are read on the next turn without restarting.
 If the firmware's catalog request fails, basic speed and stop controls remain
 available. No patterns or device context appear while the device is unavailable.
 
-`HANDY_PATTERN_MIN_RATE` and `HANDY_PATTERN_MAX_RATE` bound the pattern timing
-multiplier (defaults **0.1–1.0**). `HANDY_PATTERN_MAX_AMPLITUDE` caps its stroke
+`HANDY_PATTERN_MAX_RATE` is the global ceiling on pattern maxima (default **1.0**).
+The effective maximum is the smaller of the row's maximum and this ceiling.
+`HANDY_PATTERN_MIN_RATE` is the minimum actual multiplier sent to the device
+(default **0.1**). A pattern capped at **0.5** therefore has a minimum relative
+rate of **0.2**. Lower values are refused rather than silently raised. The
+catalog includes `max_rate`, `effective_max_rate` and `min_playback_rate` for
+the friend. Command results and live status report her relative `playback_rate` and
+the actual `device_playback_rate` separately when the pattern can be identified.
+
+`HANDY_PATTERN_MAX_AMPLITUDE` caps its stroke
 scale (default **100%**). Values outside these limits are refused. Defaults on
-`play_device_pattern` must also fit the configured limits; explicitly pass a
-lower rate or amplitude if you lower the caps. These settings are available in
+`play_device_pattern` must also fit the configured limits. the friend always uses 100% amplitude, so a lower
+amplitude cap blocks her pattern calls instead of silently reducing their
+amplitude. The keeper's panel tests can still choose a lower amplitude within
+the cap. These settings are available in
 Senses. A maximum amplitude of 0 disables pattern motion; a maximum basic speed
 of 0 disables all the friend movement commands. `stop_device` still works.
 

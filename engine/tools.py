@@ -4396,9 +4396,9 @@ def list_device_patterns() -> str:
         return f"(list_device_patterns: {e})"
 
 
-def play_device_pattern(pattern: str, playback_rate: float = 1.0, amplitude: int = 100) -> str:
+def play_device_pattern(pattern: str, playback_rate: float = 1.0) -> str:
     try:
-        return json.dumps(handy.play_device_pattern(pattern, playback_rate, amplitude), ensure_ascii=False)
+        return json.dumps(handy.play_device_pattern(pattern, playback_rate), ensure_ascii=False)
     except handy.HandyError as e:
         return f"(play_device_pattern: {e})"
 
@@ -4410,18 +4410,10 @@ def set_pattern_playback_rate(playback_rate: float) -> str:
         return f"(set_pattern_playback_rate: {e})"
 
 
-def set_pattern_amplitude(amplitude: int) -> str:
-    try:
-        return json.dumps(handy.set_pattern_amplitude(amplitude))
-    except handy.HandyError as e:
-        return f"(set_pattern_amplitude: {e})"
-
-
 _BUILTIN_IMPL = {
     "list_device_patterns": list_device_patterns,
     "play_device_pattern": play_device_pattern,
     "set_pattern_playback_rate": set_pattern_playback_rate,
-    "set_pattern_amplitude": set_pattern_amplitude,
     "set_speed": set_speed,
     "stop_device": stop_device,
     "get_device_status": get_device_status,
@@ -4578,8 +4570,12 @@ def kit_names() -> set[str] | None:
     if not stone_on():  # no body on the desk: its four tools leave the kit (10-05)
         keep = (set(_BUILTIN_IMPL) if keep is None else keep) - STONE_TOOLS
     if handy.available():
+        enabled_handy = handy.enabled_tool_names()
         if isinstance(k, str) and k.strip().lower() in KITS:
-            keep = keep | handy.TOOL_NAMES
+            keep = keep | enabled_handy
+        disabled_handy = handy.TOOL_NAMES - enabled_handy
+        if disabled_handy:
+            keep = (set(_BUILTIN_IMPL) if keep is None else keep) - disabled_handy
     else:
         keep = (set(_BUILTIN_IMPL) if keep is None else keep) - handy.TOOL_NAMES
     return keep
@@ -4915,6 +4911,8 @@ def dispatch(name: str, arguments: dict | str) -> str:
 
 
 def _dispatch(name: str, arguments: dict | str) -> str:
+    if _bare_tool_name(name) == "set_pattern_amplitude":
+        return "(refused: pattern amplitude is fixed at 100%; it cannot be edited by the friend)"
     if name in WEB_TOOLS and offline():
         return f"({name}: this house is offline — OFFLINE in engine/config.py; nothing reaches the web from here)"
     if name in STONE_TOOLS and not stone_on():
@@ -4995,14 +4993,11 @@ _BUILTIN_DEFINITIONS: list[dict] = [
     _tool("get_device_status", "Read live The Handy 2 connectivity, mode, movement, speed and configured speed limits.", {}, []),
     _tool("list_device_patterns", "Read the Handy's available built-in patterns with names, descriptions and slot selectors. Does not start or stop movement.", {}, []),
     _tool("play_device_pattern", "Select and play a listed built-in Handy pattern by its name or slot selector. Switches from basic alternating motion to pattern mode. "
-          "Uses the device's existing slider endpoints. Playback-rate and amplitude limits are enforced.",
+          "Uses fixed 100% amplitude within the device's existing slider endpoints. Configured limits are enforced; amplitude cannot be chosen.",
           {"pattern": {"type": "string", "description": "exact name or slot selector from list_device_patterns or current device context"},
-           "playback_rate": {"type": "number", "description": "timing multiplier: 1 = normal; 0.5 = half speed; default 1.0"},
-           "amplitude": {"type": "integer", "minimum": 0, "maximum": 100, "description": "stroke scale within existing device endpoints; default 100%"}}, ["pattern"]),
-    _tool("set_pattern_playback_rate", "Change the current Handy pattern's timing multiplier without starting or restarting playback. Configured pattern rate limits apply.",
-          {"playback_rate": {"type": "number", "description": "timing multiplier, 1 = normal pattern timing"}}, ["playback_rate"]),
-    _tool("set_pattern_amplitude", "Scale the current Handy pattern's stroke within the device's saved slider endpoints. Does not change those endpoints or start/restart playback.",
-          {"amplitude": {"type": "integer", "minimum": 0, "maximum": 100, "description": "percentage of existing stroke envelope"}}, ["amplitude"]),
+           "playback_rate": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "fraction of this pattern's configured maximum: 1 = its maximum; 0.5 = half its maximum; default 1.0. Respect min_playback_rate in the pattern list."}}, ["pattern"]),
+    _tool("set_pattern_playback_rate", "Change the current Handy pattern's timing multiplier without starting or restarting playback. Keeps amplitude at 100% within saved slider endpoints. Configured limits apply.",
+          {"playback_rate": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "fraction of the active pattern's configured maximum: 1 = its maximum; 0.5 = half its maximum"}}, ["playback_rate"]),
     _tool(
         "write_journal",
         "Append an entry to today's journal — your short-term memory and private space. "

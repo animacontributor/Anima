@@ -225,11 +225,12 @@ TOUCHSTONE_LATER_MAX = 12         # touches that may wait in the board at once
 # No credentials: no tools or context.
 # Percent of the device's configured maximum velocity, not mm/s. Out-of-range
 # requests are refused; 0 always stops, even when the minimum is above zero.
+HANDY_SPEED_COMMANDS = True     # off: patterns only; stop and status remain available
 HANDY_MIN_SPEED = 1
 HANDY_MAX_SPEED = 50
 # HRPP script speed is a multiplier, independent of HAMP's motor percentage.
-HANDY_PATTERN_MIN_RATE = 0.1
-HANDY_PATTERN_MAX_RATE = 1.0     # 1 = the pattern's original timing
+HANDY_PATTERN_MIN_RATE = 0.1     # minimum actual device multiplier of original timing
+HANDY_PATTERN_MAX_RATE = 1.0     # global ceiling; per-pattern maxima are in handy-patterns.json
 HANDY_PATTERN_MAX_AMPLITUDE = 100  # percentage within the device's saved endpoints
 HANDY_TIMEOUT_S = 3              # timeout for each cloud API request
 HANDY_STATUS_CACHE_S = 10        # availability refresh; tool status reads are live

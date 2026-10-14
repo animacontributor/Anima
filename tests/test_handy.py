@@ -36,6 +36,7 @@ class Device:
         self.pattern = self.patterns[0]
         self.rate, self.amplitude = 1.0, 1.0
         self.pattern_list_wrapped = False
+        self.rotate_pattern_ids_on_mode_change = False
 
     def __call__(self, request, timeout):
         path = request.full_url.removeprefix(handy.API_URL)
@@ -57,6 +58,8 @@ class Device:
         elif path == "/mode2":
             self.mode = data["mode"]
             self.running = False
+            if self.rotate_pattern_ids_on_mode_change and self.mode==9:
+                for pattern in self.patterns:pattern['id']+=1000
             result = {"mode": self.mode, "mode_session_id": 42}
         elif path == "/hrpp/patterns":
             result = {"patterns": self.patterns} if self.pattern_list_wrapped else self.patterns
@@ -96,6 +99,7 @@ class HandyTests(unittest.TestCase):
         capture.__enter__()
         self.addCleanup(capture.__exit__, None, None, None)
         patches = [patch.object(config, "MEMORY_DIR", Path(self.temp.name)),
+                   patch.object(config, "HANDY_SPEED_COMMANDS", True),
                    patch.object(config, "HANDY_MIN_SPEED", 10),
                    patch.object(config, "HANDY_MAX_SPEED", 50),
                    patch.object(config, "HANDY_TIMEOUT_S", 3),
@@ -130,7 +134,7 @@ class HandyTests(unittest.TestCase):
         self.assertTrue(all(c[0] == 'GET' for c in self.device.calls))
         self.assertEqual(self.device.mode, 7)
 
-    def test_keeper_labels_descriptions_and_exclusions_are_live_and_stable_by_id(self):
+    def test_keeper_labels_descriptions_and_exclusions_survive_slot_order_changes(self):
         self.assertTrue(panel.handy_patterns()['ok'])
         self.assertTrue(panel.handy_patterns([
             {'id':100,'name':'Gentle waves','description':'Slow changes in rhythm','enabled':True},
@@ -147,6 +151,46 @@ class HandyTests(unittest.TestCase):
         self.assertTrue(all(c[0] == 'GET' for c in self.device.calls))
         self.assertNotIn('Secret', (self.saved.parent/'handy-patterns.json').read_text())
 
+    def test_aliases_and_exclusions_survive_firmware_id_changes(self):
+        rows = handy.list_device_patterns(include_disabled=True)['patterns']
+        changes = [dict(p, name='Gentle waves' if p['slot']==0 else p['name'], enabled=p['slot']!=1) for p in rows]
+        saved = handy.save_pattern_names(changes)
+        self.assertEqual(saved['path'], str((self.saved.parent/'handy-patterns.json').resolve()))
+        for p in self.device.patterns: p['id'] += 10000
+        handy.invalidate()
+        result = handy.list_device_patterns(include_disabled=True)['patterns']
+        self.assertEqual(result[0]['name'], 'Gentle waves')
+        self.assertFalse(result[1]['enabled'])
+        self.assertEqual(result[0]['preference_key'], 'name:pattern 0')
+        handy.save_pattern_names([dict(p, enabled=p['slot'] not in (1,2)) for p in result])
+        settings = json.loads((self.saved.parent/'handy-patterns.json').read_text())['patterns']
+        self.assertEqual(len(settings),10)
+        self.assertTrue(all(k.startswith('name:') for k in settings))
+        self.assertFalse(settings['name:pattern 2']['enabled'])
+        self.assertTrue(all(c[0]=='GET' for c in self.device.calls))
+
+    def test_legacy_factory_name_preferences_migrate_without_duplicate_name_rejection(self):
+        legacy = {str(p['id']): {'name':p['name'],'description':'','enabled':p['slot']!=1} for p in self.device.patterns}
+        path=self.saved.parent/'handy-patterns.json';path.write_text(json.dumps({'patterns':legacy}))
+        for p in self.device.patterns: p['id'] += 10000
+        rows = handy.list_device_patterns(include_disabled=True)['patterns']
+        self.assertFalse(rows[1]['enabled'])
+        result = panel.handy_patterns([dict(p, enabled=p['slot'] not in (1,2)) for p in rows])
+        self.assertTrue(result['ok'], result)
+        settings = json.loads(path.read_text())['patterns']
+        self.assertEqual(len(settings),10)
+        self.assertFalse(settings['name:pattern 1']['enabled'])
+        self.assertFalse(settings['name:pattern 2']['enabled'])
+        self.assertFalse(any(k.isdecimal() for k in settings))
+        self.assertTrue(all(c[0]=='GET' for c in self.device.calls))
+
+    def test_named_preferences_save_locally_after_device_disconnects(self):
+        rows = handy.list_device_patterns(include_disabled=True)['patterns']
+        self.device.connected=False;self.device.calls.clear()
+        self.assertTrue(panel.handy_patterns([dict(p, enabled=p['slot']!=1) for p in rows])['ok'])
+        self.assertFalse(self.device.calls)
+        self.assertFalse(json.loads((self.saved.parent/'handy-patterns.json').read_text())['patterns']['name:pattern 1']['enabled'])
+
     def test_duplicate_invalid_names_are_refused_without_overwriting_choices(self):
         for rows in ([{'id':100,'name':'Same'},{'id':101,'name':'same'}],
                      [{'id':100,'name':'slot:0'}], [{'id':100,'name':'line\nbreak'}],
@@ -161,7 +205,7 @@ class HandyTests(unittest.TestCase):
             self.assertIn('unknown, disabled or ambiguous', tools.play_device_pattern(pattern))
         self.assertTrue(all(c[0] == 'GET' for c in self.device.calls))
 
-    def test_keeper_can_test_excluded_patterns_while_lumi_still_cannot_select_them(self):
+    def test_keeper_can_test_excluded_patterns_while_friend_still_cannot_select_them(self):
         handy.save_pattern_names([{'id':101,'name':'Not for the friend','enabled':False}])
         self.assertNotIn('Not for the friend', handy.section())
         result=panel.handy_pattern_test(1,.5,70)
@@ -180,7 +224,8 @@ class HandyTests(unittest.TestCase):
         self.assertFalse(self.device.calls)
         with patch.object(config,'HANDY_PATTERN_MAX_RATE',.4),patch.object(config,'HANDY_PATTERN_MAX_AMPLITUDE',60):
             result=panel.handy_patterns()
-            self.assertEqual(result['test_limits']['rate'],.4)
+            self.assertEqual(result['test_limits']['rate'],1.0)
+            self.assertEqual(result['test_limits']['max_rate'],1.0)
             self.assertEqual(result['test_limits']['amplitude'],60)
             self.assertTrue(panel.handy_pattern_test(1,.4,60)['ok'])
         panel.handy_stop()
@@ -200,7 +245,7 @@ class HandyTests(unittest.TestCase):
         self.assertEqual(result['pattern_id'], 103)
         self.assertEqual(result['amplitude'], 100)
         writes = [c[1] for c in self.device.calls if c[0] == 'PUT']
-        self.assertEqual(writes, ['/mode2','/hrpp/patterns/3/activate','/hrpp/playbackrate','/hrpp/amplitude','/hrpp/start'])
+        self.assertEqual(writes, ['/mode2','/mode2','/hrpp/patterns/3/activate','/hrpp/playbackrate','/hrpp/amplitude','/hrpp/start'])
         self.assertFalse(any('slider' in c[1] or 'stroke' in c[1] for c in self.device.calls))
         self.assertEqual(handy.get_device_status()['playback_rate'], 1.0)
         self.assertIn('pattern mode; playing', assemble.handy_section())
@@ -209,9 +254,36 @@ class HandyTests(unittest.TestCase):
 
     def test_pattern_change_stops_old_motion_before_activation(self):
         self.device.mode, self.device.running = 9, True
-        handy.play_device_pattern('slot:5', .5, 70)
+        handy.play_device_pattern('slot:5', .5)
         self.assertEqual([(c[1],c[2]) for c in self.device.calls if c[0] == 'PUT'][:2], [('/mode2',{'mode':7}),('/mode2',{'mode':9})])
-        self.assertEqual((self.device.rate,self.device.amplitude), (.5,.7))
+        self.assertEqual((self.device.rate,self.device.amplitude), (.5,1.0))
+
+    def test_friend_and_panel_switch_patterns_with_stop_first_when_firmware_ids_change(self):
+        self.device.rotate_pattern_ids_on_mode_change=True
+        rows=handy.list_device_patterns(include_disabled=True)['patterns']
+        handy.save_pattern_names([dict(p,max_rate=.5) for p in rows])
+        for slot in (0,3,0,4):
+            self.device.calls.clear()
+            result = (handy.play_device_pattern(f'slot:{slot}',.5) if slot%2==0
+                      else panel.handy_pattern_test(slot,.5,100)['status'])
+            self.assertTrue(result['running'])
+            self.assertTrue(self.device.running)
+            self.assertEqual(result['pattern_slot'],slot)
+            self.assertEqual(result['pattern_device_name'],f'Pattern {slot}')
+            self.assertEqual(result['device_playback_rate'],.25)
+            writes=[(c[1],c[2]) for c in self.device.calls if c[0]=='PUT']
+            self.assertEqual(writes[:2],[('/mode2',{'mode':7}),('/mode2',{'mode':9})])
+            self.assertEqual(writes[-1],('/hrpp/start',{}))
+            self.assertEqual(sum(path=='/mode2' and data=={'mode':7} for path,data in writes),1)
+            self.assertFalse(any('stroke' in c[1] or 'slider' in c[1] for c in self.device.calls))
+
+    def test_pattern_verification_rejects_wrong_factory_name_even_in_requested_slot(self):
+        self.device.replies['/hrpp/state']=[
+            {'play_state':1,'current_pattern':self.device.patterns[0],'playback_rate':1,'amplitude':1},
+            {'play_state':2,'current_pattern':dict(self.device.patterns[0],name='Different preset'),'playback_rate':1,'amplitude':1}]
+        self.assertIn('not confirmed',tools.play_device_pattern('slot:0'))
+        self.assertEqual(self.device.mode,7)
+        self.assertFalse(self.device.running)
 
     def test_pattern_rate_and_amplitude_changes_do_not_start_or_restart_playback(self):
         self.device.mode, self.device.running = 9, True
@@ -226,14 +298,76 @@ class HandyTests(unittest.TestCase):
         for rate in (None,True,'0.5',0,-1,1.1,float('nan'),float('inf')):
             self.assertTrue(tools.set_pattern_playback_rate(rate).startswith('('))
         for amplitude in (None,True,'50',1.5,-1,101):
-            self.assertTrue(tools.set_pattern_amplitude(amplitude).startswith('('))
+            with self.assertRaises(handy.HandyError):
+                handy.set_pattern_amplitude(amplitude)
         for kwargs in ({'playback_rate':True},{'amplitude':True},{'playback_rate':2},{'amplitude':101}):
-            self.assertTrue(tools.play_device_pattern('slot:1',**kwargs).startswith('('))
-        with patch.object(config,'HANDY_PATTERN_MAX_RATE',.5):
-            self.assertIn('between', tools.play_device_pattern('slot:1'))
+            self.assertTrue(tools._dispatch('play_device_pattern',{'pattern':'slot:1',**kwargs}).startswith('('))
         with patch.object(config,'HANDY_PATTERN_MAX_AMPLITUDE',0):
             self.assertIn('disabled', tools.play_device_pattern('slot:1'))
         self.assertFalse(self.device.calls)
+
+    def test_custom_maximum_scales_play_and_rate_changes_without_double_scaling(self):
+        rows=handy.list_device_patterns(include_disabled=True)['patterns']
+        self.assertTrue(panel.handy_patterns([dict(p,max_rate=.5 if p['slot']==0 else .8) for p in rows])['ok'])
+        result=json.loads(tools.play_device_pattern('slot:0',.5))
+        self.assertEqual(result['playback_rate'],.5)
+        self.assertEqual(result['device_playback_rate'],.25)
+        self.assertEqual((self.device.rate,self.device.amplitude),(.25,1.0))
+        self.assertEqual(handy.get_device_status()['playback_rate'],.5)
+        self.assertEqual(handy.get_device_status()['device_playback_rate'],.25)
+        self.device.calls.clear()
+        result=json.loads(tools.set_pattern_playback_rate(.8))
+        self.assertAlmostEqual(result['device_playback_rate'],.4)
+        self.assertEqual([c[1] for c in self.device.calls if c[0]=='PUT'],['/hrpp/playbackrate'])
+        result=handy.play_device_pattern('slot:0')
+        self.assertEqual(result['device_playback_rate'],.5)
+        self.assertEqual(result['playback_rate'],1)
+        result=handy.play_device_pattern('slot:1',.5)
+        self.assertAlmostEqual(result['device_playback_rate'],.4)
+        self.assertFalse(any('slider' in c[1] or 'stroke' in c[1] for c in self.device.calls))
+
+    def test_custom_maximum_survives_identity_changes_and_old_label_saves(self):
+        rows=handy.list_device_patterns(include_disabled=True)['patterns']
+        handy.save_pattern_names([dict(p,max_rate=.5) for p in rows])
+        for p in self.device.patterns:p['id']+=1000
+        handy.invalidate()
+        rows=handy.list_device_patterns(include_disabled=True)['patterns']
+        self.assertEqual(rows[0]['max_rate'],.5)
+        self.assertEqual(rows[0]['min_playback_rate'],.2)
+        self.assertIn('maximum 0.5',handy.section())
+        self.assertIn('fraction',handy.section())
+        self.assertTrue(panel.handy_pattern_test(0,.5,65)['ok'])
+        self.assertEqual((self.device.rate,self.device.amplitude),(.25,.65))
+        handy.save_pattern_names([{'id':rows[0]['id'],'name':'Gentle waves','enabled':True}])
+        self.assertEqual(handy.list_device_patterns()['patterns'][0]['max_rate'],.5)
+
+    def test_custom_maximum_respects_global_ceiling_and_physical_minimum(self):
+        rows=handy.list_device_patterns(include_disabled=True)['patterns']
+        handy.save_pattern_names([dict(p,max_rate=.5) for p in rows])
+        self.device.calls.clear()
+        self.assertIn('>= 0.2',tools.play_device_pattern('slot:0',.1))
+        self.assertFalse(any(c[0]=='PUT' for c in self.device.calls))
+        with patch.object(config,'HANDY_PATTERN_MAX_RATE',.4):
+            result=handy.play_device_pattern('slot:0',.5)
+            self.assertEqual(result['effective_max_rate'],.4)
+            self.assertEqual(result['device_playback_rate'],.2)
+            self.assertEqual(result['playback_rate'],.5)
+            self.assertEqual(handy.play_device_pattern('slot:0',.25)['device_playback_rate'],.1)
+        self.device.calls.clear()
+        for value in (0,-1,True,None,'0.5',float('nan'),float('inf')):
+            old=(self.saved.parent/'handy-patterns.json').read_bytes()
+            self.assertFalse(panel.handy_patterns([dict(rows[0],max_rate=value)])['ok'])
+            self.assertEqual((self.saved.parent/'handy-patterns.json').read_bytes(),old)
+        self.assertFalse(self.device.calls)
+
+    def test_maximum_editor_remains_available_with_invalid_global_rate_settings(self):
+        with patch.object(config,'HANDY_PATTERN_MAX_RATE',0):
+            result=panel.handy_patterns()
+            self.assertTrue(result['ok'],result)
+            self.assertIsNone(result['test_limits'])
+            self.assertIsNone(result['patterns'][0]['effective_max_rate'])
+            self.assertTrue(panel.handy_patterns([dict(result['patterns'][0],max_rate=.5)])['ok'])
+            self.assertTrue(all(c[0]=='GET' for c in self.device.calls))
 
     def test_pattern_failure_attempts_stop_without_retrying_motion_or_leaking_secrets(self):
         self.device.fail['/hrpp/start'] = TimeoutError('deviceSecret tokenSecret')
@@ -259,9 +393,9 @@ class HandyTests(unittest.TestCase):
         for mode,running in ((7,False),(9,False),(9,True),(0,True)):
             self.device.mode,self.device.running=mode,running
             self.device.calls.clear();handy.invalidate()
-            self.assertTrue(handy.play_device_pattern('slot:0',.25,30)['running'])
+            self.assertTrue(handy.play_device_pattern('slot:0',.25)['running'])
             self.assertFalse(any(c[1]=='/hrpp/stop' for c in self.device.calls))
-            self.assertEqual((self.device.rate,self.device.amplitude),(.25,.3))
+            self.assertEqual((self.device.rate,self.device.amplitude),(.25,1.0))
             if running:
                 self.assertEqual(self.device.calls[next(i for i,c in enumerate(self.device.calls) if c[0]=='PUT')][2],{'mode':7})
             handy.stop_device()
@@ -430,6 +564,79 @@ class HandyTests(unittest.TestCase):
             result = tools._dispatch("set_speed", {"speed": speed})
             self.assertTrue(result.startswith("("), (speed, result))
         self.assertFalse(self.device.calls)
+
+    def test_patterns_only_setting_hides_speed_in_every_kit_and_in_context(self):
+        with patch.object(config, 'HANDY_SPEED_COMMANDS', False):
+            for kit in ('full', 'small', 'tiny', list(handy.TOOL_NAMES)):
+                with patch.object(config, 'TOOL_KIT', kit):
+                    self.assertNotIn('set_speed', self.names())
+                    self.assertTrue(handy.TOOL_NAMES - {'set_speed'} <= self.names())
+                    voice_names = {d['function']['name'] for d in voice_initiative.voice_tools()}
+                    self.assertNotIn('set_speed', voice_names)
+                    section = assemble.handy_section()
+                    self.assertNotIn('set_speed(', section)
+                    self.assertIn('play_device_pattern(', section)
+                    self.assertIn('normal speed commands are disabled', section)
+            self.assertNotIn('set_speed(', handy.section())
+        self.assertIn('set_speed', self.names())
+        self.assertIn('set_speed(', assemble.handy_section())
+
+    def test_disabled_speed_refuses_stale_calls_but_patterns_and_stop_still_work(self):
+        with patch.object(config, 'HANDY_SPEED_COMMANDS', False):
+            self.assertIn('disabled', tools._dispatch('set_speed', {'speed': 30}))
+            self.assertFalse(self.device.calls)
+            self.assertTrue(handy.play_device_pattern('slot:0', .25)['running'])
+            self.assertTrue(handy.get_device_status()['available'])
+            self.assertTrue(handy.set_speed(0)['stopped'])
+            self.assertTrue(panel.handy_pattern_test(0, .25, 30)['ok'])
+            self.assertTrue(panel.handy_stop()['ok'])
+
+    def test_friend_has_no_amplitude_tool_or_argument_and_stale_calls_cannot_write(self):
+        definitions = {d['function']['name']: d['function'] for d in tools.current_definitions()}
+        self.assertNotIn('set_pattern_amplitude', definitions)
+        self.assertNotIn('set_pattern_amplitude', tools._BUILTIN_IMPL)
+        self.assertNotIn('amplitude', definitions['play_device_pattern']['parameters']['properties'])
+        self.assertNotIn('set_pattern_amplitude', handy.section())
+        self.assertIn('Amplitude is fixed at 100%', handy.section())
+        self.device.calls.clear()
+        self.assertTrue(tools._dispatch('play_device_pattern', {'pattern':'slot:0','amplitude':30}).startswith('('))
+        self.assertIn('fixed at 100%', tools._dispatch('set_pattern_amplitude', {'amplitude':30}))
+        self.assertFalse(any(c[0]=='PUT' for c in self.device.calls))
+
+    def test_friend_play_and_rate_changes_restore_full_amplitude_after_manual_testing(self):
+        self.assertTrue(panel.handy_pattern_test(0,.5,30)['ok'])
+        self.assertEqual(self.device.amplitude,.3)
+        result=json.loads(tools.set_pattern_playback_rate(.25))
+        self.assertEqual(result['amplitude'],100)
+        self.assertEqual(result['playback_rate'],.25)
+        self.assertTrue(self.device.running)
+        self.assertTrue(panel.handy_pattern_test(0,.5,30)['ok'])
+        result=json.loads(tools.play_device_pattern('slot:0',.25))
+        self.assertEqual(result['amplitude'],100)
+        self.assertEqual(self.device.amplitude,1.0)
+        self.assertFalse(any('slider' in c[1] or 'stroke' in c[1] for c in self.device.calls))
+
+    def test_fixed_amplitude_does_not_override_a_lower_keeper_cap(self):
+        with patch.object(config,'HANDY_PATTERN_MAX_AMPLITUDE',60):
+            self.assertTrue(tools.play_device_pattern('slot:0').startswith('('))
+            self.assertTrue(tools.set_pattern_playback_rate(.25).startswith('('))
+            self.assertFalse(self.device.calls)
+            self.assertTrue(panel.handy_pattern_test(0,.25,60)['ok'])
+
+    def test_speed_toggle_is_a_boolean_in_senses_and_saves_without_changing_patterns(self):
+        path = self.saved.parent / 'engine' / 'config.py'
+        path.parent.mkdir()
+        path.write_text('HANDY_SPEED_COMMANDS = True\nHANDY_MAX_SPEED = 50\nHANDY_PATTERN_MAX_RATE = 1.0\n')
+        with patch.object(panel, 'CONFIG_FILE', path):
+            row = next(r for r in panel.tabs()['Senses'] if r['name'] == 'HANDY_SPEED_COMMANDS')
+            self.assertEqual(row['kind'], 'bool')
+            self.assertTrue(row['value'])
+            result = panel.save({'HANDY_SPEED_COMMANDS': False})
+            self.assertEqual(result['changed'], ['HANDY_SPEED_COMMANDS'])
+            self.assertEqual(result['error'], '')
+            self.assertIn('HANDY_SPEED_COMMANDS = False', path.read_text())
+            self.assertIn('HANDY_MAX_SPEED = 50', path.read_text())
+            self.assertIn('HANDY_PATTERN_MAX_RATE = 1.0', path.read_text())
 
     def test_invalid_limits_disable_motion_but_allow_stop(self):
         for low, high in ((60, 50), (-1, 50), (1, 101), (True, 50), (1, 2.0)):
