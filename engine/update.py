@@ -154,11 +154,19 @@ def read_version(root: Path) -> str:
 # first line and is still not ours — FRIEND is asked first, always.
 ENGINE = (
     "engine/*.py",          # the engine itself — every module but config.py
+    "engine/*.js",          # local browser microphone and voice controls
+    "engine/*.cjs", "engine/discord_voice_package*.json",
+    "android/", "bat/allow-phone-wifi.ps1",
     "tests/",               # the suite that proves it
     "anima.bat", "bat/*.bat",  # the panel's door at the root, every other launcher in bat/
     "*.bat",                # launchers at the root (where they lived before 0.13's bat/ — so an update moves the old ones to the backup)
     "*.command", "*.sh", "bat/*.command", "bat/*.sh",  # their twins for a Mac (.command) and Linux (.sh), beside them
     "README.md", "CHANGELOG.md", "LICENSE", "VERSION", "requirements.txt", ".gitignore", ".gitattributes",
+    "VOICE.md", "requirements-voice.txt", "requirements-voice-overrides.txt",
+    "requirements-voice-design.txt",
+    "requirements-voice-kyutai.txt",
+    "requirements-audio.txt", "requirements-spatial.txt",
+    "PHONE.md", "DISCORD-VOICE.md", "HANDY.md", "AUDIO.md", "DELIVERY.md", "SPATIAL.md",
 )
 
 # What it must never touch. config.py holds the keeper's names, paths and

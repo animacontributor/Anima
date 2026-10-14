@@ -121,59 +121,6 @@ class VoiceTests(unittest.TestCase):
             self.assertEqual(voice_worker.handle({"op": "transcribe"})["text"], "A statement.")
         cleanup.assert_called_once()
 
-    def test_voice_disabled_starts_no_worker_and_keeps_text_available(self):
-        session = parlor.Session()
-        with patch.object(config, "LIVE_VOICE_ENABLED", False), \
-             patch.object(parlor, "SESSION", session), \
-             patch.object(live_voice.WORKER, "request") as speech, \
-             patch.object(session, "send", return_value={"reply": "A text reply."}) as send:
-            server = parlor.ThreadingHTTPServer(("127.0.0.1", 0), parlor.Handler)
-            thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
-            base = f"http://127.0.0.1:{server.server_address[1]}"
-            try:
-                with urllib.request.urlopen(base) as r:
-                    page = r.read()
-                self.assertNotIn(b'id="voiceToggle"', page)
-                self.assertNotIn(b'<script src="/parlor-voice.js">', page)
-                for path in ("/live-voice/settings", "/parlor-voice.js", "/voice-worklet.js"):
-                    with self.assertRaises(urllib.error.HTTPError) as failure:
-                        urllib.request.urlopen(base + path)
-                    self.assertEqual(failure.exception.code, 404); failure.exception.close()
-                request = urllib.request.Request(base + "/live-voice/warmup", data=b"{}")
-                with self.assertRaises(urllib.error.HTTPError) as failure:
-                    urllib.request.urlopen(request)
-                self.assertEqual(failure.exception.code, 404); failure.exception.close()
-                request = urllib.request.Request(base + "/send", data=b'{"text":"Hello"}')
-                with urllib.request.urlopen(request) as r:
-                    self.assertEqual(json.load(r)["reply"], "A text reply.")
-                send.assert_called_once_with("Hello")
-                speech.assert_not_called()
-            finally:
-                server.shutdown(); server.server_close(); thread.join(2)
-
-    def test_voice_uses_chat_context_and_inherits_thinking_and_tool_checks(self):
-        history = []
-        responses = [{"role": "assistant", "content": "", "tool_calls": [{"function": {
-            "name": "remember", "arguments": {"text": "A synthetic fact", "type": "note"}}}]},
-            {"role": "assistant", "content": "I remembered it."}]
-        with patch.object(chat.assemble, "system_prompt", return_value="existing identity") as system, \
-             patch.object(chat.assemble, "moment", return_value=("", [])), \
-             patch.object(config, "LIVE_VOICE_THINK", None), \
-             patch.object(chat.ollama_client, "chat", side_effect=responses) as run, \
-             patch.object(chat.tools, "refresh_her_tools"), \
-             patch.object(chat.tools, "dispatch", return_value="remembered") as dispatch, \
-             patch.object(chat, "mark_visit_live"):
-            reply = chat.one_turn(history, "Remember this", mode="voice", on_event=lambda *args: None)
-        self.assertEqual(reply, "I remembered it.")
-        self.assertEqual(system.call_args.kwargs["mode"], "chat")
-        dispatch.assert_called_once()
-        self.assertEqual(run.call_count, 2)
-        for call in run.call_args_list:
-            self.assertIsNone(call.kwargs["think"])
-            self.assertNotIn("think_retries", call.kwargs)
-            self.assertTrue(call.kwargs["expect_words"])
-            self.assertIs(call.kwargs["tools"], chat.tools.DEFINITIONS)
-
     def test_unused_cuda_cache_is_released_without_unloading_models(self):
         cuda = SimpleNamespace(is_initialized=lambda: True, empty_cache=Mock())
         stt, tts = object(), object()
@@ -255,7 +202,7 @@ class VoiceTests(unittest.TestCase):
         self.assertFalse(seen[0]["vad_filter"])
 
     def test_recognition_request_keeps_names_and_adds_vocabulary(self):
-        worker = live_voice.Worker()
+        worker = live_voice.Worker(recognition_only=True)
         stream = io.StringIO()
         worker.proc = SimpleNamespace(stdin=stream)
         worker.responses.put({"id": "test", "text": "That is Squadron 42."})
@@ -272,10 +219,47 @@ class VoiceTests(unittest.TestCase):
         self.assertEqual(sent["stt_beam_size"], 5)
         worker.proc = None
 
+    def test_recognition_completes_while_speech_request_is_backpressured(self):
+        worker = live_voice.Worker()
+        entered, release = threading.Event(), threading.Event()
+        stream = io.StringIO()
+        worker.proc = SimpleNamespace(stdin=stream)
+        worker.responses.put({"id": "speech", "event": "audio", "audio": "unused"})
+        worker.responses.put({"id": "speech", "seconds": 1})
+        results = []
+        def publish(packet):
+            entered.set()
+            release.wait(2)
+            return True
+        recognizer = Mock(request=Mock(return_value={"text": "Please stop."}))
+        worker.recognizer = recognizer
+        with patch.object(worker, "_start"), patch.object(live_voice.uuid, "uuid4", return_value=SimpleNamespace(hex="speech")):
+            thread = threading.Thread(target=lambda: results.append(worker.request("synthesize_stream", on_audio=publish)))
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertEqual(worker.request("transcribe", audio="microphone"), {"text": "Please stop."})
+                self.assertTrue(thread.is_alive())
+                recognizer.request.assert_called_once_with("transcribe", audio="microphone")
+            finally:
+                release.set(); thread.join(2)
+                worker.proc = None; worker.recognizer = None
+        self.assertEqual(results, [{"id": "speech", "seconds": 1}])
+
+    def test_recognition_only_warmup_never_loads_or_generates_speech(self):
+        recognizer = SimpleNamespace(transcribe=Mock(return_value=(iter([]), None)))
+        with patch.object(voice_worker, "models") as models, patch.object(voice_worker, "_stt", recognizer), \
+             patch.object(voice_worker, "_stt_warmed", False), patch.object(voice_worker, "park_recognizer"), \
+             patch.object(voice_worker, "generate") as generate:
+            self.assertEqual(voice_worker.handle({"op": "warmup", "recognition_only": True}), {"ready": True})
+        self.assertEqual(models.call_count, 1)
+        self.assertFalse(models.call_args.kwargs["speech"])
+        generate.assert_not_called()
+
     def test_kyutai_generation_uses_the_selected_delivery(self):
         seen = {}
         class Kyutai:
-            def synthesize(self, text, style, voice=None):
+            def synthesize(self, text, style, voice):
                 seen.update(text=text, style=style, voice=voice)
                 return [0., .1], 24000, .1
         with patch.object(voice_worker, "_tts", Kyutai()):
@@ -283,6 +267,20 @@ class VoiceTests(unittest.TestCase):
         self.assertEqual(seen["style"], "desire")
         self.assertEqual(rate, 24000)
         rendered = chat.render_turn({"role": "user", "content": "hello", "_voice_mode": True, "_voice_backend": "kyutai"})
+        self.assertNotIn("[chuckle]", rendered["content"])
+    def test_native_qwen_uses_cached_voice_and_does_not_speak_chatterbox_tags(self):
+        seen = {}
+        class Qwen:
+            def generate_voice_clone(self, **kwargs):
+                seen.update(kwargs)
+                return [[0., .1]], 24000
+        prompt = {"voice": "mellow"}
+        with patch.object(voice_worker, "_tts", Qwen()), patch.object(voice_worker, "_clone_prompt", prompt):
+            samples, rate = voice_worker.generate({"backend": "qwen"}, "[chuckle] Hello.")
+        self.assertEqual(seen["text"], "Hello.")
+        self.assertIs(seen["voice_clone_prompt"], prompt)
+        self.assertEqual(rate, 24000)
+        rendered = chat.render_turn({"role": "user", "content": "hello", "_voice_mode": True, "_voice_backend": "qwen"})
         self.assertNotIn("[chuckle]", rendered["content"])
     def test_chunks_keep_expression_and_remove_written_format(self):
         chunks = live_voice.speech_chunks("**Hello.** [chuckle] Nice to see you. *leans closer*\n```python\nx=1\n```\n[site](https://example.com)", 65)
@@ -306,6 +304,11 @@ class VoiceTests(unittest.TestCase):
         self.assertTrue(all(len(c) <= 100 for c in chunks))
         self.assertEqual(" ".join(chunks), longer.strip())
 
+    def test_whole_reply_keeps_all_sentences_in_one_synthesis_request(self):
+        text = "\n\n".join(["A longer reply with several sentences. Take your time."] * 12)
+        with patch.object(config, "LIVE_VOICE_SPLIT_REPLIES", False):
+            self.assertEqual(live_voice.speech_chunks(text), [" ".join(text.split())])
+
     def test_cancel_discards_in_flight_synthesis(self):
         begun = threading.Event(); release = threading.Event()
         class Slow(Speech):
@@ -322,7 +325,7 @@ class VoiceTests(unittest.TestCase):
     def test_phrase_audio_has_backpressure_and_receipts(self):
         playback = live_voice.Playback(Speech(), stream=False)
         phrases = [word + " is a complete sentence with enough words to stand alone." for word in ("One", "Two", "Three", "Four")]
-        with patch.object(config, "LIVE_VOICE_CHUNK_CHARS", 65):
+        with patch.object(config, "LIVE_VOICE_CHUNK_CHARS", 65), patch.object(config, "LIVE_VOICE_SPLIT_REPLIES", True):
             job = playback.start(" ".join(phrases), playback.cancel(), {})
         for _ in range(100):
             if len(playback.status(job)["chunks"]) == 2: break
@@ -407,20 +410,29 @@ class VoiceTests(unittest.TestCase):
         self.assertEqual(chat.render_turn({"role": "user", "content": "Hello"})["content"], "Hello")
         history = []
         old_think = config.CHAT_THINK
-        with patch.object(chat.assemble, "system_prompt", return_value="existing identity"), \
+        with patch.object(chat.assemble, "system_prompt", return_value="the friend's existing identity"), \
              patch.object(chat.assemble, "moment", return_value=("", [])), \
              patch.object(config, "LIVE_VOICE_THINK", False), \
              patch.object(chat.ollama_client, "chat", return_value={"role": "assistant", "content": "Hi."}) as run, \
              patch.object(chat.tools, "refresh_her_tools"), patch.object(chat, "mark_visit_live"):
             chat.one_turn(history, "Hello", mode="voice", on_event=lambda *args: None)
         self.assertFalse(run.call_args.kwargs["think"])
-        self.assertNotIn("think_retries", run.call_args.kwargs)
+        self.assertEqual(run.call_args.kwargs["think_retries"], 0)
         self.assertEqual(config.CHAT_THINK, old_think)
 
+    def test_audition_paths_cannot_escape_their_folder(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(config, "VOICE_ASSETS_DIR", Path(folder) / "voices"):
+            home = Path(folder) / "voices" / "auditions"; home.mkdir(parents=True)
+            manifest = {"voices": [{"id": "soft", "label": "Soft and close", "reference": "soft.wav", "preview": "preview.wav"}]}
+            (home / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            self.assertEqual(parlor.audition_file("soft.wav"), home / "soft.wav")
+            for name in ("../keeper.md", "other.wav", "..\\memory.db"):
+                with self.assertRaises(ValueError): parlor.audition_file(name)
+            manifest["voices"][0]["reference"] = "../private.wav"
+            (home / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaises(ValueError): parlor.audition_file("../private.wav")
 
     def test_local_http_contract_and_origin_checks(self):
-        self.voice_enabled = patch.object(config, "LIVE_VOICE_ENABLED", True)
-        self.voice_enabled.start(); self.addCleanup(self.voice_enabled.stop)
         server = parlor.ThreadingHTTPServer(("127.0.0.1", 0), parlor.Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
@@ -443,6 +455,41 @@ class VoiceTests(unittest.TestCase):
         finally:
             server.shutdown(); server.server_close(); thread.join(2)
 
+    def test_voice_upload_preview_and_selection_stay_outside_shared(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            assets = root / ".runtime" / "voices"
+            auditions = assets / "auditions"
+            auditions.mkdir(parents=True)
+            preview = wav()
+            (auditions / "preview.wav").write_bytes(preview)
+            (auditions / "soft.wav").write_bytes(preview)
+            (auditions / "manifest.json").write_text(json.dumps({"voices": [
+                {"id": "soft", "label": "Soft", "reference": "soft.wav", "preview": "preview.wav"}
+            ]}), encoding="utf-8")
+            with patch.object(config, "ROOT", root), patch.object(config, "VOICE_ASSETS_DIR", assets), \
+                 patch.object(config, "SHARED_DIR", root / "shared"), \
+                 patch.object(config, "LIVE_VOICE_BACKEND", "chatterbox"), \
+                 patch.object(parlor, "save_voice_reference", side_effect=lambda p, *a: p.relative_to(root).as_posix()) as save:
+                server = parlor.ThreadingHTTPServer(("127.0.0.1", 0), parlor.Handler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                try:
+                    with urllib.request.urlopen(base + "/live-voice/audition/preview.wav") as response:
+                        self.assertEqual(response.read(), preview)
+                    payload = {"audio": base64.b64encode(preview).decode(), "name": "sample.wav"}
+                    request = urllib.request.Request(base + "/live-voice/reference", data=json.dumps(payload).encode())
+                    with urllib.request.urlopen(request) as response:
+                        saved = json.load(response)["saved"]
+                    self.assertEqual((root / saved).read_bytes(), preview)
+                    self.assertTrue(saved.startswith(".runtime/voices/reference-"))
+                    request = urllib.request.Request(base + "/live-voice/select-audition", data=b'{"id":"soft"}')
+                    with urllib.request.urlopen(request) as response:
+                        self.assertEqual(json.load(response)["saved"], ".runtime/voices/auditions/soft.wav")
+                    self.assertEqual(save.call_args.args[0], auditions / "soft.wav")
+                    self.assertFalse((root / "shared").exists())
+                finally:
+                    server.shutdown(); server.server_close(); thread.join(2)
 
 
 if __name__ == "__main__":

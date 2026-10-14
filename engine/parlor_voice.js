@@ -2,6 +2,9 @@
 (() => {
   const toggle = document.getElementById('voiceToggle');
   const state = document.getElementById('voiceState');
+  const sample = document.getElementById('voiceSample');
+  const file = document.getElementById('voiceFile');
+  const choice = document.getElementById('voiceChoice');
   let enabled = false, starting = false, context, stream, source, microphone, mute;
   let settings, recording = [], preRoll = [], preLength = 0, sampleCount = 0;
   let voicedMs = 0, candidateMs = 0, silenceMs = 0, active = false;
@@ -10,7 +13,9 @@
   let currentJob = null, player = null, completed = 0, phase = 'off', noise = .002;
   const players = new Set();
   let lastVoiceAt = 0;
+  let initiativeTimer = null, initiativeChecking = false, lastCaptureAt = 0;
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const inputPending = () => active || candidateMs > 0 || pending.length > 0 || draining || busy;
   function status(text) { state.textContent = text; }
   function resetUtterance() { recording = []; sampleCount = 0; voicedMs = 0; candidateMs = 0; silenceMs = 0; active = false; }
   function resetCapture() { resetUtterance(); preRoll = []; preLength = 0; }
@@ -44,7 +49,7 @@
     if (!job) return;
     try { await post('/live-voice/delivery', {job, completed: count, partial, reason}); } catch (_) {}
   }
-  async function interrupt(reason = 'unknown') {
+  async function interrupt(reason = 'unknown', cancelServer = true) {
     playbackGeneration++;
     const job = currentJob, count = completed, partial = !!player;
     currentJob = null; completed = 0;
@@ -53,7 +58,7 @@
     // Submit the receipt before cancellation replaces the current job.
     interruptTask = interruptTask.then(async () => {
       await receipt(job, count, partial, reason);
-      try { await post('/live-voice/interrupt'); } catch (_) {}
+      if (cancelServer) { try { await post('/live-voice/interrupt'); } catch (_) {} }
     });
     await interruptTask;
     if (enabled && !draining && !active) { phase = 'listening'; status('listening'); }
@@ -61,7 +66,52 @@
   window.interruptLiveVoice = interrupt;
   window.voiceVisitChanged = () => { visitGeneration++; };
 
-  async function play(job, token, endedAt, timings) {
+  let stateReporting = false;
+  async function checkInitiative() {
+    if (!enabled) return;
+    const now = performance.now(), blocked = [];
+    for (const [code, value] of [['checking',initiativeChecking],['busy',busy],['recognizing',draining],['capture',active],
+        ['candidate',candidateMs],['queued',pending.length],['playback',currentJob],['scheduled_audio',players.size],
+        ['output_unavailable',!context || context.state !== 'running'],['microphone_stale',now-lastCaptureAt>3000]]) {
+      if (value) blocked.push(code);
+    }
+    const clientState = {blocked,phase,mic_age_ms:now-lastCaptureAt,queued_turns:pending.length,
+      scheduled_audio:players.size,candidate_ms:candidateMs};
+    if (blocked.length) {
+      if (!stateReporting) {
+        stateReporting = true;
+        try { await post('/live-voice/initiative/state', {state:clientState}); } catch (_) {}
+        finally { stateReporting = false; }
+      }
+      return;
+    }
+    initiativeChecking = true;
+    const token = lifecycle, visit = visitGeneration, generation = playbackGeneration;
+    try {
+      await interruptTask;
+      const result = await post('/live-voice/initiative', {state:clientState});
+      // Recording may begin AFTER the request was sent. Hold the late
+      // continuation while that audio is checked; accepted words advance the
+      // playback generation, while rejected noise lets the continuation play.
+      while (enabled && token === lifecycle && visit === visitGeneration &&
+             generation === playbackGeneration && inputPending()) await delay(25);
+      if (token !== lifecycle || visit !== visitGeneration || generation !== playbackGeneration || !enabled) {
+        if (result.speech_job) {
+          await receipt(result.speech_job, 0, false, 'discarded continuation');
+          await post('/live-voice/interrupt', {job: result.speech_job});
+        }
+        return;
+      }
+      if (result.error) sys(result.error);
+      else if (result.reply && result.speech_job) {
+        add('msg her', md(result.reply));
+        play(result.speech_job, token, undefined, undefined, true);
+      }
+    } catch (e) { if (enabled && token === lifecycle) sys('Voice continuation: ' + e.message); }
+    finally { initiativeChecking = false; }
+  }
+
+  async function play(job, token, endedAt, timings, initiative = false) {
     const generation = playbackGeneration;
     currentJob = job; completed = 0;
     let next = 0;
@@ -77,6 +127,9 @@
           const response = await fetch('/live-voice/audio/' + job + '/' + next, {cache: 'no-store'});
           if (!response.ok) throw new Error('speech audio became unavailable');
           const audio = await context.decodeAudioData(await response.arrayBuffer());
+          // Also cover input arriving during the first audio fetch/decode.
+          while (initiative && first && enabled && token === lifecycle &&
+                 generation === playbackGeneration && inputPending()) await delay(25);
           if (!enabled || token !== lifecycle || generation !== playbackGeneration) break;
           phase = 'speaking'; if (!active) status('speaking — you can interrupt');
           const node = context.createBufferSource(); node.buffer = audio; node.connect(context.destination); player = node;
@@ -114,7 +167,7 @@
       sys('Voice: ' + e.message);
       if (generation === playbackGeneration && currentJob === job) await interrupt('playback_error');
     }
-    if (enabled && token === lifecycle && !active) { phase = 'listening'; status('listening'); }
+    if (enabled && token === lifecycle && generation === playbackGeneration && !currentJob && !active) { phase = 'listening'; status('listening'); }
   }
 
   async function drain() {
@@ -124,27 +177,33 @@
       while (enabled && pending.length) {
         while (busy && enabled) await delay(100);
         if (!enabled) break;
-        const item = pending.shift(), audio = item.audio, token = lifecycle, visit = visitGeneration, speechGeneration = playbackGeneration;
-        busy = true; send.disabled = true; phase = 'thinking';
-        if (!active) status('listening to your words, then thinking…');
-        const typing = add('typing', '<span>●</span><span>●</span><span>●</span>');
-        let result;
+        const item = pending.shift(), audio = item.audio, token = lifecycle, visit = visitGeneration;
+        let speechGeneration = playbackGeneration, result, typing, accepted = false;
+        status(currentJob ? 'speaking — checking sound…' : 'checking sound…');
         try {
           await interruptTask;
-          result = await post('/live-voice/turn', {audio});
-          if (visit !== visitGeneration) continue;
+          const recognition = await post('/live-voice/recognize', {audio});
+          if (!enabled || token !== lifecycle || visit !== visitGeneration || speechGeneration !== playbackGeneration) continue;
+          if (recognition.error) { sys('Voice: ' + recognition.error); continue; }
+          if (!recognition.accepted) { status(currentJob ? 'speaking' : recognition.empty ? 'no words detected — listening' : 'listening'); continue; }
+          const stopping = interrupt('accepted microphone', false); speechGeneration = playbackGeneration;
+          busy = true; accepted = true; send.disabled = true; phase = 'thinking'; status('thinking…');
+          typing = add('typing', '<span>●</span><span>●</span><span>●</span>');
+          add('msg me', md(recognition.transcript)); await stopping;
+          if (!enabled || token !== lifecycle || visit !== visitGeneration || speechGeneration !== playbackGeneration) continue;
+          result = await post('/live-voice/turn', {input: recognition.input});
+          if (visit !== visitGeneration || token !== lifecycle) continue;
           if (result.error) sys('Voice: ' + result.error);
           else if (result.empty) { if (!active) status('no words detected — listening'); }
           else {
-            add('msg me', md(result.transcript));
             addThinking(result.thinking); addChips(result.tools); add('msg her', md(result.reply));
             (result.voices || []).forEach(v => add('msg her voice', '<audio controls src="' + v.url + '"></audio><small> voice note</small>'));
             (result.notes || []).forEach(n => add('sys warn', esc(n)));
             if (result.tokens) add('sys tokens', esc(result.tokens.line));
           }
         } catch (e) { sys('Voice connection failed: ' + e.message); }
-        finally { typing.remove(); busy = false; send.disabled = box.disabled; }
-        if (result && result.speech_job && token === lifecycle && speechGeneration === playbackGeneration && enabled && !pending.length) {
+        finally { if (typing) typing.remove(); if (accepted) { busy = false; send.disabled = box.disabled; } }
+        if (result && result.speech_job && token === lifecycle && speechGeneration === playbackGeneration && enabled) {
           // Do not block recognition of another utterance on audio playback.
           play(result.speech_job, token, item.endedAt, result.timings);
         }
@@ -165,6 +224,7 @@
   }
   function capture(pcm) {
     if (!enabled || !(pcm instanceof Float32Array)) return;
+    lastCaptureAt = performance.now();
     let energy = 0;
     for (const v of pcm) energy += v * v;
     const rms = Math.sqrt(energy / pcm.length), ms = pcm.length / context.sampleRate * 1000;
@@ -181,7 +241,7 @@
       const confirmation = Math.max(settings.min_speech_ms, phase === 'speaking' ? (settings.interrupt_ms || 350) : 200);
       if (candidateMs < confirmation) return;
       active = true; recording = preRoll.slice(); sampleCount = preLength; voicedMs = candidateMs; silenceMs = 0;
-      interrupt('microphone'); status('hearing you…'); return;
+      status(currentJob ? 'speaking — checking sound…' : 'checking sound…'); return;
     }
     recording.push(pcm); sampleCount += pcm.length;
     if (voiced) { voicedMs += ms; silenceMs = 0; } else silenceMs += ms;
@@ -190,7 +250,9 @@
 
   async function stop() {
     enabled = false; starting = false; lifecycle++; pending = []; resetCapture();
+    clearInterval(initiativeTimer); initiativeTimer = null;
     await interrupt('voice_stopped');
+    try { await post('/live-voice/stop'); } catch (_) {}
     if (stream) stream.getTracks().forEach(t => t.stop());
     if (microphone) { microphone.port.onmessage = null; microphone.disconnect(); }
     if (source) source.disconnect(); if (mute) mute.disconnect();
@@ -199,24 +261,72 @@
     phase = 'off'; toggle.textContent = 'start voice'; toggle.disabled = box.disabled; status('voice is off');
   }
   window.stopLiveVoice = stop;
-  async function loadStyle() {
-    const values = await (await fetch('/live-voice/settings')).json();
-    document.getElementById('kyutaiStyle').value = values.style || 'calm';
+  async function loadAuditions() {
+    try {
+      const data = await (await fetch('/live-voice/auditions')).json();
+      const values = await (await fetch('/live-voice/settings')).json();
+      const backend = values.backend || 'chatterbox';
+      const chosen = (data.voices || []).find(v => (v.backend || 'chatterbox') === backend &&
+        (backend === 'kyutai' ? v.style === values.style : values.reference.endsWith('/' + v.reference)));
+      choice.textContent = '· ' + (chosen ? chosen.label : backend === 'kyutai' ? 'Kyutai · ' + values.style : values.reference ? 'custom voice' : 'bundled voice');
+      document.getElementById('kyutaiControls').hidden = backend !== 'kyutai';
+      document.getElementById('kyutaiStyle').value = values.style || 'calm';
+      document.getElementById('deliveryControls').hidden = backend !== 'kyutai'||!values.split_replies;
+      const d=values.delivery||{pause_ms:180};
+      document.getElementById('deliveryPause').value=d.pause_ms;
+      deliveryLabels();
+      sample.disabled = backend === 'kyutai';
+      const options = document.getElementById('voiceOptions'); options.replaceChildren();
+      document.getElementById('voiceAuditions').hidden = !(data.voices || []).length;
+      for (const voice of data.voices || []) {
+        const card = document.createElement('div'); card.className = 'voice-option';
+        const label = document.createElement('strong'); label.textContent = voice.label; card.appendChild(label);
+        const audio = document.createElement('audio'); audio.controls = true; audio.preload = 'none';
+        audio.src = '/live-voice/audition/' + encodeURIComponent(voice.preview);
+        audio.onplay = () => { document.querySelectorAll('#voiceOptions audio').forEach(a => { if (a !== audio) a.pause(); }); stop(); };
+        card.appendChild(audio);
+        const select = document.createElement('button'); select.textContent = chosen && chosen.id === voice.id ? 'selected' : 'use this voice';
+        select.onclick = async () => {
+          select.disabled = true;
+          try {
+            await stop(); document.querySelectorAll('#voiceOptions audio').forEach(a => a.pause());
+            const result = await post('/live-voice/select-audition', {id: voice.id});
+            if (result.error) throw new Error(result.error);
+            sys(result.label + ' selected. Start voice to hear the friend with this voice.');
+            await loadAuditions();
+          } catch (e) { sys('Voice selection: ' + e.message); }
+          finally { select.disabled = false; }
+        };
+        card.appendChild(select); options.appendChild(card);
+      }
+    } catch (_) { /* Older engines have no audition listing. */ }
   }
-  loadStyle().catch(e => sys('Voice settings: ' + e.message));
+  loadAuditions();
+  function deliveryLabels(){
+    document.getElementById('deliveryPauseLabel').textContent=document.getElementById('deliveryPause').value+' ms';
+  }
+  document.getElementById('deliveryPause').oninput=deliveryLabels;
+  document.getElementById('saveDelivery').onclick=async()=>{
+    const button=document.getElementById('saveDelivery');button.disabled=true;
+    try{
+      const result=await post('/live-voice/dynamics',{settings:{pause_ms:Number(document.getElementById('deliveryPause').value)}});
+      if(result.error)throw Error(result.error);document.getElementById('deliveryNote').textContent='Applied to subsequent replies.';
+    }catch(e){sys('Voice dynamics: '+e.message);}finally{button.disabled=false;}
+  };
   document.getElementById('kyutaiStyle').onchange = async event => {
     const style = event.target.value;
     try {
       await stop();
       const result = await post('/live-voice/style', {style});
       if (result.error) throw new Error(result.error);
-      sys('Delivery changed. Start voice to continue.');
-    } catch (e) { sys('Delivery: ' + e.message); await loadStyle(); }
+      await loadAuditions(); sys('Delivery changed. Start voice to continue.');
+    } catch (e) { sys('Delivery: ' + e.message); await loadAuditions(); }
   };
   toggle.onclick = async () => {
     if (enabled || starting) { await stop(); return; }
     if (!navigator.mediaDevices || !window.AudioWorkletNode) { sys('This browser needs microphone and AudioWorklet support; use current Chrome, Edge or Firefox on localhost.'); return; }
     starting = true; const token = ++lifecycle; toggle.textContent = 'stop voice'; status('opening microphone…');
+    document.querySelectorAll('#voiceOptions audio').forEach(a => a.pause());
     try {
       settings = await (await fetch('/live-voice/settings')).json();
       const captured = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1}});
@@ -232,11 +342,30 @@
       microphone.port.onmessage = event => capture(event.data);
       stream.getTracks().forEach(track => track.onended = () => { if (enabled) stop(); });
       enabled = true; starting = false; resetCapture(); phase = 'listening'; status('listening');
+      await post('/live-voice/start');
+      if (token !== lifecycle || !enabled) { await post('/live-voice/stop'); return; }
+      lastCaptureAt = performance.now();
+      initiativeTimer = setInterval(checkInitiative, 1000);
     } catch (e) { if (token === lifecycle) { sys('Voice: ' + e.message); await stop(); } }
   };
+  sample.onclick = () => file.click();
+  file.onchange = async () => {
+    const selected = file.files[0]; if (!selected) return;
+    if (selected.size > 10 * 1024 * 1024) { sys('Choose a voice sample under 10 MB.'); return; }
+    await stop(); status('saving voice sample…');
+    try {
+      const result = await post('/live-voice/reference', {name: selected.name, audio: bytes64(new Uint8Array(await selected.arrayBuffer()))});
+      if (result.error) throw new Error(result.error);
+      sys('Voice sample saved locally. Start voice to use it. A clean English sample of 6–15 seconds works best.');
+      await loadAuditions();
+    } catch (e) { sys('Voice sample: ' + e.message); }
+    finally { file.value = ''; status('voice is off'); }
+  };
   window.addEventListener('pagehide', () => {
+    enabled = false; lifecycle++; clearInterval(initiativeTimer);
     if (stream) stream.getTracks().forEach(t => t.stop());
     if (currentJob) navigator.sendBeacon('/live-voice/delivery', new Blob([JSON.stringify({job: currentJob, completed, partial: !!player, reason: 'page_closed'})], {type: 'application/json'}));
     navigator.sendBeacon('/live-voice/interrupt', new Blob(['{}'], {type: 'application/json'}));
+    navigator.sendBeacon('/live-voice/stop', new Blob(['{}'], {type: 'application/json'}));
   });
 })();

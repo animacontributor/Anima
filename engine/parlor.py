@@ -21,7 +21,7 @@ import webbrowser
 import base64
 import html
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -33,6 +33,8 @@ import doors
 import ollama_client
 import tools
 import live_voice
+import delivery
+import voice_initiative
 
 HOST, PORT = "127.0.0.1", 8765
 
@@ -47,8 +49,10 @@ class Session:
         self.file: Path | None = None  # this visit's transcript, rewritten after every reply
         self.last_activity = time.time()
         self.reflected_upto = 0  # history index they have already sat with (the pause)
-        self.playback = live_voice.Playback()
+        self.playback = live_voice.Playback(delivery_factory=delivery.live)
         self.generation = 0
+        self.initiative = voice_initiative.Clock()
+        self.voice_inputs = {}
 
     def _checkpoint(self) -> None:
         if self.file is None:
@@ -58,7 +62,12 @@ class Session:
         except OSError:
             pass
 
-    def send(self, text: str, spoken=False, epoch=None, generation=None) -> dict:
+    def send(self, text: str, spoken=False, epoch=None, generation=None,
+             mode=None, physicalize=False, physicalize_voice=None, accepted_voice=False) -> dict:
+        if not spoken:
+            self.interrupt_voice()
+        if not accepted_voice:
+            self.initiative.heard()
         events: list[dict] = []
 
         def collect(kind, payload):
@@ -71,14 +80,16 @@ class Session:
             try:
                 beginning = len(self.history)
                 started = time.monotonic()
+                presence = {"physicalize": True} if physicalize else {}
+                if physicalize and physicalize_voice is not None:
+                    presence['physicalize_voice']=physicalize_voice
                 reply = chat.one_turn(self.history, text,
                                       images=self.attached or None, on_event=collect,
-                                      mode="voice" if spoken else "chat")
-                if spoken:
-                    reply = chat.strip_voice_delivery(reply)
-                    for turn in self.history[beginning:]:
-                        if turn.get("role") == "assistant" and turn.get("content"):
-                            turn["content"] = chat.strip_voice_delivery(turn["content"])
+                                      mode=mode or ("voice" if spoken else "chat"), **presence)
+                reply = chat.strip_voice_delivery(reply)
+                for turn in self.history[beginning:]:
+                    if turn.get("role") == "assistant" and turn.get("content"):
+                        turn["content"] = chat.strip_voice_delivery(turn["content"])
                 self.attached = []
                 speech_job = None
                 if spoken:
@@ -86,6 +97,7 @@ class Session:
                     if assistant:
                         assistant["_voice_delivery"] = "Written reply generated; spoken playback has not been confirmed."
                         speech_job = self.playback.start(reply, epoch, assistant)
+                        self.initiative.speaking(speech_job)
                         if speech_job is None:
                             assistant["_voice_delivery"] = "Speech cancelled before playback; the written reply was generated."
                 self._checkpoint()
@@ -113,7 +125,117 @@ class Session:
                 if any(t is turn for t in self.history):
                     turn["_voice_delivery"] = note
                     self._checkpoint()
+                    self.initiative.finished(job_id, interrupted="interrupted" in note.lower())
         return {"ok": True}
+
+    def interrupt_voice(self, job=None):
+        # A late discarded initiative result must not cancel a newer reply.
+        with self.initiative.lock:
+            if self.playback.cancel(job) is not None:
+                self.voice_inputs.clear()
+                self.initiative.interrupt()
+
+    def transcribe_voice(self, encoded, worker=None, mode="voice"):
+        """Hold new initiatives while checking audio; acceptance cancels playback."""
+        if not isinstance(encoded, str) or len(encoded) > 1400000:
+            raise ValueError("Expected at most 31 seconds of microphone audio.")
+        validate_wav(base64.b64decode(encoded, validate=True))
+        with self.initiative.lock:
+            generation, epoch = self.generation, self.playback.epoch
+            self.initiative.begin_recognition()
+        started = time.monotonic()
+        voice_initiative.console_log(mode, "Recognition started; checking microphone audio without interrupting playback.")
+        try:
+            heard = (worker or live_voice.WORKER).request("transcribe", audio=encoded,
+                vocab=f"Names: {config.USER_NAME}, {chat.friend_name()}.").get("text", "").strip()
+        except Exception as error:
+            voice_initiative.console_log(mode, f"Recognition failed after {time.monotonic() - started:.2f}s: {type(error).__name__}: {error}")
+            raise
+        finally:
+            self.initiative.end_recognition()
+        voice_initiative.console_log(mode, f"Recognition finished in {time.monotonic() - started:.2f}s; "
+                                    + ("words returned, validating the prompt." if heard else "no words returned."))
+        return {"text": heard, "generation": generation, "epoch": epoch,
+                "recognition_s": round(time.monotonic() - started, 3), "mode": mode}
+
+    def accept_voice(self, recognized):
+        with self.initiative.lock:
+            if recognized["generation"] != self.generation or recognized["epoch"] != self.playback.epoch:
+                voice_initiative.console_log(recognized["mode"], "Microphone result discarded; the visit or playback changed while checking audio.")
+                return {"cancelled": True}
+            if not recognized["text"]:
+                self.initiative.empty_capture()
+                return {"empty": True}
+            # Acceptance, rather than acoustic activity, is the interrupt.
+            self.initiative.heard()
+            epoch = self.playback.cancel()
+            token = uuid.uuid4().hex
+            self.voice_inputs.clear()
+            self.voice_inputs[token] = dict(recognized, epoch=epoch, accepted_at=time.monotonic())
+            voice_initiative.console_log(recognized["mode"], "Microphone prompt accepted; previous speech cancelled. "
+                + "Transcript: " + json.dumps(recognized["text"], ensure_ascii=False))
+            return {"accepted": True, "input": token, "transcript": recognized["text"],
+                    "timings": {"recognition_s": recognized["recognition_s"]}}
+
+    def take_voice_input(self, token):
+        with self.initiative.lock:
+            prompt = self.voice_inputs.pop(token, None) if isinstance(token, str) else None
+            if (not prompt or prompt["generation"] != self.generation or prompt["epoch"] != self.playback.epoch
+                    or time.monotonic() - prompt["accepted_at"] > 300):
+                raise ValueError("That accepted microphone prompt expired or was cancelled. Speak again to start a new turn.")
+            return prompt
+
+    def voice_tick(self, mode="voice", physicalize=False, physicalize_voice=None):
+        self.initiative.request_received()
+        if not self.lock.acquire(blocking=False):
+            self.initiative.monitor(server_busy=True)
+            return {"quiet": True}
+        try:
+            claim = self.initiative.claim()
+            if claim is None:
+                return {"quiet": True}
+            epoch, generation = self.playback.epoch, self.generation
+            try:
+                decision, additions = voice_initiative.decide(self.history, claim[2], mode,
+                    physicalize=physicalize, physicalize_voice=physicalize_voice)
+            except Exception as e:
+                voice_initiative.console_log(mode, f"Decision failed: {type(e).__name__}: {e}; retry in 60s.")
+                self.initiative.resolve(claim, {"next_check_seconds": 60}, lambda: None)
+                return {"error": f"Voice continuation: {type(e).__name__}: {e}"}
+            result = {"quiet": True}
+
+            def commit():
+                if generation != self.generation:
+                    return
+                self.history.extend(additions)
+                if decision["text"]:
+                    assistant = self.history[-1]
+                    assistant["_voice_delivery"] = "Written continuation generated; spoken playback has not been confirmed."
+                    job = self.playback.start(decision["text"], epoch, assistant)
+                    self.initiative.speaking(job)
+                    result.update(reply=decision["text"], speech_job=job, initiative=True)
+                    result.pop("quiet", None)
+                    self.last_activity = time.time()
+                if additions:
+                    self._checkpoint()
+
+            self.initiative.resolve(claim, decision, commit)
+            return result
+        finally:
+            self.lock.release()
+
+    def monitor_voice(self):
+        acquired = self.lock.acquire(blocking=False)
+        if acquired:
+            self.lock.release()
+        with self.initiative.lock:
+            job = self.initiative.job
+        status = dict(self.playback.status(job), _job_id=job) if job else None
+        self.initiative.monitor(server_busy=not acquired, playback_status=status)
+
+    def watch_voice(self, stopped):
+        while not stopped.wait(1):
+            self.monitor_voice()
 
     def attach(self, source: str) -> dict:
         with self.lock:
@@ -161,6 +283,7 @@ class Session:
     def new(self, reflect=True) -> dict:
         """reflect: True — afterglow in the background; "sync" — in the
         foreground (Ctrl+C); False — skip (the window's X)."""
+        self.initiative.stop()
         self.playback.cancel()
         self.generation += 1
         with self.lock:
@@ -279,13 +402,34 @@ textarea:focus{border-color:var(--accent)}
 .attach button{font:inherit;font-size:12px;background:none;border:1px solid var(--line);color:var(--muted);
        border-radius:8px;padding:2px 8px;cursor:pointer}
 code{font-family:ui-monospace,Consolas,monospace;font-size:.92em;background:var(--chip);padding:1px 4px;border-radius:4px}
+#voiceAuditions{font-size:13px;color:var(--muted);margin:8px 0}
+#voiceAuditions summary{cursor:pointer}
+#voiceOptions{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px}
+.voice-option{border:1px solid var(--line);border-radius:10px;padding:8px 10px;max-width:300px}
+.voice-option strong{display:block;color:var(--ink);font-weight:normal}
+.voice-option audio{display:block;width:260px;height:32px;margin:6px 0}
+.voice-option button{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:6px;cursor:pointer}
+#deliveryControls{font-size:13px;color:var(--muted);margin:8px 0}
+#deliveryControls summary{cursor:pointer}
+#deliveryControls label{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 16px 0 0}
 </style></head><body>
 <header><h1 id="name">__NAME__</h1><div class="sub" id="sub">a visit · everything said here becomes memory</div>
 <button id="newbtn" title="save this conversation and start fresh">new conversation</button>
 <button id="leave" title="save and end the visit">leave</button></header>
 <div id="log"></div>
 <footer>
-__LIVE_VOICE_CONTROLS__
+ <div class="attach" id="voiceControls"><button id="voiceToggle">start voice</button>
+ <button id="voiceSample">choose voice sample…</button>
+ <input id="voiceFile" type="file" accept="audio/*" hidden>
+ <span id="voiceState" role="status" aria-live="polite">voice is off</span>
+ <span id="voiceChoice"></span></div>
+ <div class="attach" id="kyutaiControls" hidden><label for="kyutaiStyle">delivery</label>
+ <select id="kyutaiStyle"><option value="desire">Desire (US, f)</option><option value="calm">Calming (US, f)</option>
+ <option value="happy">Happy (US, f)</option><option value="neutral">Default (US, f)</option><option value="whisper">Whisper (US, f)</option></select></div>
+ <details id="deliveryControls" hidden><summary>extra section pause</summary>
+ <label>Extra pause <output id="deliveryPauseLabel">180 ms</output><input id="deliveryPause" type="range" min="0" max="600" step="20"></label>
+ <button id="saveDelivery">apply pause</button><span id="deliveryNote">Adds silence between independent synthesis sections.</span></details>
+ <details id="voiceAuditions" hidden><summary>try softer voices</summary><div id="voiceOptions"></div></details>
  <div class="row"><textarea id="box" placeholder="say something… (Enter to send, Shift+Enter for a new line)" rows="1"></textarea>
  <button id="send">send</button></div>
  <div class="attach">📎 <button id="pickbtn" title="choose a picture from your computer — it is saved to shared/pictures/ and attached">choose a picture…</button>
@@ -336,16 +480,7 @@ fileIn.onchange=()=>{const f=fileIn.files[0];if(!f)return;const rd=new FileReade
   rd.readAsDataURL(f)};
 sys("you're visiting "+document.getElementById('name').textContent+" — they can see everything said here, and it becomes their memory at the next sleep");
 box.focus();
-</script>__LIVE_VOICE_SCRIPT__</body></html>
-"""
-
-
-VOICE_CONTROLS = """
- <div class="attach" id="voiceControls"><button id="voiceToggle">start voice</button>
- <span id="voiceState" role="status" aria-live="polite">voice is off</span></div>
- <div class="attach"><label for="kyutaiStyle">delivery</label>
- <select id="kyutaiStyle"><option value="calm">Calming (US, f)</option><option value="desire">Desire (US, f)</option>
- <option value="happy">Happy (US, f)</option><option value="neutral">Default (US, f)</option></select></div>
+</script><script src="/parlor-voice.js"></script></body></html>
 """
 
 
@@ -366,9 +501,6 @@ class Handler(BaseHTTPRequestHandler):
         port = self.server.server_address[1]
         if self.headers.get("Host") not in {f"127.0.0.1:{port}", f"localhost:{port}"}:
             return self._json({"error": "This endpoint is for the local parlor."}, 403)
-        if route.startswith("/live-voice/") or route in ("/parlor-voice.js", "/voice-worklet.js"):
-            if not getattr(config, "LIVE_VOICE_ENABLED", False):
-                return self._json({"error": "Live voice is disabled in config.py."}, 404)
         if route in ("/parlor-voice.js", "/voice-worklet.js"):
             name = "parlor_voice.js" if route == "/parlor-voice.js" else "voice_worklet.js"
             return self._bytes(Path(__file__).with_name(name).read_bytes(), "text/javascript; charset=utf-8")
@@ -378,7 +510,19 @@ class Handler(BaseHTTPRequestHandler):
                                "interrupt_ms": getattr(config, "LIVE_VOICE_INTERRUPT_MS", 350),
                                "threshold": getattr(config, "LIVE_VOICE_THRESHOLD", .018),
                                "max_seconds": min(30, getattr(config, "LIVE_VOICE_MAX_SECONDS", 30)),
-                               "style": getattr(config, "LIVE_VOICE_KYUTAI_STYLE", "calm")})
+                               "reference": str(getattr(config, "LIVE_VOICE_REFERENCE", "") or ""),
+                               "backend": getattr(config, "LIVE_VOICE_BACKEND", "chatterbox"),
+                               "style": getattr(config, "LIVE_VOICE_KYUTAI_STYLE", "calm"),"delivery":delivery.live(),
+                               "split_replies":bool(getattr(config,"LIVE_VOICE_SPLIT_REPLIES",False))})
+        if route == "/live-voice/auditions":
+            return self._json(voice_auditions())
+        if route.startswith("/live-voice/audition/"):
+            name = route[len("/live-voice/audition/"):]
+            try:
+                return self._bytes(audition_file(name).read_bytes(), "audio/wav")
+            except (ValueError, OSError):
+                self.send_error(404)
+                return
         if route.startswith("/live-voice/audio/"):
             parts = route.split("/")
             try:
@@ -405,9 +549,6 @@ class Handler(BaseHTTPRequestHandler):
         if self.path not in ("/", "/index.html"):
             self.send_response(404); self.end_headers(); return
         page = PAGE.replace("__NAME__", html.escape(chat.friend_name())).replace("__ME__", config.USER_NAME.replace("'", "\\'"))
-        enabled = bool(getattr(config, "LIVE_VOICE_ENABLED", False))
-        page = page.replace("__LIVE_VOICE_CONTROLS__", VOICE_CONTROLS if enabled else "")
-        page = page.replace("__LIVE_VOICE_SCRIPT__", '<script src="/parlor-voice.js"></script>' if enabled else "")
         body = page.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -442,8 +583,6 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             return self._json({"error": "Expected a JSON object."}, 400)
         if self.path.startswith("/live-voice/"):
-            if not getattr(config, "LIVE_VOICE_ENABLED", False):
-                return self._json({"error": "Live voice is disabled in config.py."}, 404)
             try:
                 return self._live_voice(data)
             except (live_voice.VoiceError, ValueError, OSError) as e:
@@ -474,6 +613,15 @@ class Handler(BaseHTTPRequestHandler):
             with (folder / "voice-latency.jsonl").open("a", encoding="utf-8") as log:
                 log.write(json.dumps(metrics) + "\n")
             return self._json({"ok": True})
+        if self.path == "/live-voice/dynamics":
+            values=delivery.clean(data.get('settings',{}))
+            names={'pause_ms':'LIVE_VOICE_KYUTAI_PAUSE_MS'}
+            changes={name:values[key] for key,name in names.items()}
+            import knobs
+            _,refused,error=knobs.save(Path(config.__file__),changes)
+            if refused or error:raise ValueError(error or 'Could not save voice dynamics.')
+            for key,value in changes.items():setattr(config,key,value)
+            return self._json({'ok':True,'settings':values})
         if self.path == "/live-voice/style":
             from kyutai_voice import STYLES
             style = data.get("style")
@@ -489,11 +637,24 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/live-voice/warmup":
             status = live_voice.WORKER.request("check")
             if not status["installed"]:
-                command = "python engine/setup_voice.py"
+                command = "python engine/setup_voice.py" + {"qwen": " --qwen", "kyutai": " --kyutai"}.get(getattr(config, "LIVE_VOICE_BACKEND", "chatterbox"), "")
                 raise live_voice.VoiceError("Missing voice packages: " + ", ".join(status["missing"]) + ". Run " + command + ".")
             return self._json(live_voice.WORKER.request("warmup"))
         if self.path == "/live-voice/interrupt":
+            SESSION.interrupt_voice(data.get("job"))
+            return self._json({"ok": True})
+        if self.path == "/live-voice/start":
+            SESSION.initiative.start()
+            return self._json({"ok": True})
+        if self.path == "/live-voice/stop":
+            SESSION.initiative.stop()
             SESSION.playback.cancel()
+            return self._json({"ok": True})
+        if self.path == "/live-voice/initiative":
+            SESSION.initiative.report_client(data.get("state"))
+            return self._json(SESSION.voice_tick())
+        if self.path == "/live-voice/initiative/state":
+            SESSION.initiative.report_client(data.get("state"))
             return self._json({"ok": True})
         if self.path == "/live-voice/status":
             return self._json(SESSION.playback.status(str(data.get("job") or "")))
@@ -502,23 +663,108 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True})
         if self.path == "/live-voice/delivery":
             return self._json(SESSION.delivery(str(data.get("job") or ""), int(data.get("completed") or 0), bool(data.get("partial")), str(data.get("reason") or "unknown")))
+        if self.path == "/live-voice/recognize":
+            return self._json(SESSION.accept_voice(SESSION.transcribe_voice(data.get("audio"))))
         if self.path == "/live-voice/turn":
-            epoch = SESSION.playback.cancel()
-            generation = SESSION.generation
-            encoded = data.get("audio")
-            if not isinstance(encoded, str) or len(encoded) > 1400000:
-                raise ValueError("Expected at most 31 seconds of microphone audio.")
-            validate_wav(base64.b64decode(encoded, validate=True))
-            started = time.monotonic()
-            heard = live_voice.WORKER.request("transcribe", audio=encoded,
-                                             vocab=f"Names: {config.USER_NAME}, {chat.friend_name()}.")["text"].strip()
-            recognition_s = time.monotonic() - started
-            if not heard:
-                return self._json({"empty": True})
-            result = SESSION.send(heard, spoken=True, epoch=epoch, generation=generation)
-            result.setdefault("timings", {})["recognition_s"] = round(recognition_s, 3)
+            token = data.get("input")
+            if token is None:  # Keep older clients working without early server cancellation.
+                accepted = SESSION.accept_voice(SESSION.transcribe_voice(data.get("audio")))
+                if not accepted.get("accepted"):
+                    return self._json(accepted)
+                token = accepted["input"]
+            prompt = SESSION.take_voice_input(token)
+            result = SESSION.send(prompt["text"], spoken=True, epoch=prompt["epoch"],
+                                  generation=prompt["generation"], accepted_voice=True)
+            result.setdefault("timings", {})["recognition_s"] = prompt["recognition_s"]
             return self._json(result)
+        if self.path == "/live-voice/reference":
+            if getattr(config, "LIVE_VOICE_BACKEND", "chatterbox") == "kyutai":
+                raise ValueError("Kyutai uses released voices. Select a delivery style or an audition instead.")
+            encoded = data.get("audio")
+            if not isinstance(encoded, str):
+                raise ValueError("Choose an audio file first.")
+            raw = base64.b64decode(encoded, validate=True)
+            if not raw or len(raw) > 10 * 1024 * 1024:
+                raise ValueError("Voice sample must be under 10 MB.")
+            ext = Path(str(data.get("name") or "")).suffix.lower()
+            if ext not in (".wav", ".mp3", ".flac", ".ogg", ".m4a"):
+                raise ValueError("Choose a WAV, MP3, FLAC, OGG or M4A voice sample.")
+            folder = voice_assets_dir()
+            folder.mkdir(parents=True, exist_ok=True)
+            dest = folder / ("reference-" + uuid.uuid4().hex + ext)
+            dest.write_bytes(raw)
+            relative = save_voice_reference(dest)
+            SESSION.playback.cancel()
+            return self._json({"saved": relative})
+        if self.path == "/live-voice/select-audition":
+            chosen = next((v for v in voice_auditions()["voices"] if v.get("id") == data.get("id")), None)
+            if not chosen:
+                raise ValueError("This voice preview is no longer available.")
+            if chosen.get("backend") == "kyutai":
+                from kyutai_voice import STYLES
+                style = chosen.get("style")
+                if style not in STYLES:
+                    raise ValueError("Unknown Kyutai voice style.")
+                import knobs
+                changes = {"LIVE_VOICE_BACKEND": "kyutai", "LIVE_VOICE_KYUTAI_STYLE": style}
+                _, refused, error = knobs.save(Path(config.__file__), changes)
+                if refused or error:
+                    raise ValueError(error or "Could not select Kyutai voice.")
+                config.LIVE_VOICE_BACKEND = "kyutai"
+                config.LIVE_VOICE_KYUTAI_STYLE = style
+                relative = STYLES[style]
+            else:
+                relative = save_voice_reference(audition_file(chosen["reference"]), chosen.get("backend", "chatterbox"))
+            SESSION.playback.cancel()
+            return self._json({"saved": relative, "label": chosen["label"]})
         return self._json({"error": "Unknown voice endpoint."}, 404)
+
+
+def save_voice_reference(path: Path, backend=None) -> str:
+    live_voice.WORKER.request("reference_info", path=str(path), backend=backend or getattr(config, "LIVE_VOICE_BACKEND", "chatterbox"))
+    import knobs
+    relative = path.relative_to(config.ROOT).as_posix()
+    changes = {"LIVE_VOICE_REFERENCE": relative}
+    if backend is not None:
+        if backend not in ("chatterbox", "qwen"):
+            raise ValueError("Unknown voice backend.")
+        changes["LIVE_VOICE_BACKEND"] = backend
+    _, refused, error = knobs.save(Path(config.__file__), changes)
+    if error or refused:
+        raise ValueError(error or "Could not save LIVE_VOICE_REFERENCE in config.py.")
+    config.LIVE_VOICE_REFERENCE = relative
+    if backend is not None:
+        config.LIVE_VOICE_BACKEND = backend
+    return relative
+
+
+def voice_assets_dir() -> Path:
+    return Path(getattr(config, "VOICE_ASSETS_DIR", config.ROOT / ".runtime" / "voices"))
+
+
+def voice_auditions() -> dict:
+    folder = voice_assets_dir() / "auditions"
+    try:
+        data = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+        voices = data.get("voices", [])
+        if not isinstance(voices, list):
+            return {"voices": []}
+        return {"voices": [v for v in voices if isinstance(v, dict) and isinstance(v.get("id"), str)
+                           and isinstance(v.get("label"), str) and isinstance(v.get("reference"), str)
+                           and isinstance(v.get("preview"), str)]}
+    except (OSError, ValueError, AttributeError):
+        return {"voices": []}
+
+
+def audition_file(name: str) -> Path:
+    names = {v[field] for v in voice_auditions()["voices"] for field in ("reference", "preview")}
+    if not isinstance(name, str) or name not in names or Path(name).name != name or not name.endswith(".wav"):
+        raise ValueError("Unknown voice audition.")
+    folder = voice_assets_dir() / "auditions"
+    path = folder / name
+    if not path.resolve().is_relative_to(folder.resolve()):
+        raise ValueError("Voice audition is outside its folder.")
+    return path
 
 
 def validate_wav(raw: bytes):
@@ -540,20 +786,22 @@ def main() -> None:
     if taken:
         print(taken)
         return
-    server_class = ThreadingHTTPServer if getattr(config, "LIVE_VOICE_ENABLED", False) else HTTPServer
-    server_class.allow_reuse_address = sys.platform != "win32"
-    server = server_class((HOST, PORT), Handler)
+    ThreadingHTTPServer.allow_reuse_address = sys.platform != "win32"
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
     url = f"http://{HOST}:{PORT}"
     print(f"The parlor is open: {url}")
     print("Close the visit with the 'leave' button, Ctrl+C here, or this window's X — all three save it.")
     threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     threading.Thread(target=SESSION.ticker, daemon=True).start()  # the pause bell
+    voice_monitor_stopped = threading.Event()
+    threading.Thread(target=SESSION.watch_voice, args=(voice_monitor_stopped,), daemon=True).start()
     chat.guard_console_close(lambda: SESSION.new(reflect=False))  # the window's X saves the visit too
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        voice_monitor_stopped.set()
         r = SESSION.new(reflect="sync")  # save, then their minute with the visit
         if r.get("saved"):
             print(f"\n(conversation saved: {r['saved']} — it becomes memory at the next consolidation)")

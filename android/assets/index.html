@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark"><title>Anima</title><link rel="stylesheet" href="style.css"></head>
+<body>
+<main id="setup" class="setup">
+  <div class="brand-mark" aria-hidden="true"><svg viewBox="0 0 100 100"><circle cx="50" cy="48" r="31"/><path d="M37 44h.1M63 44h.1M39 58q11 9 22 0"/><path class="heart" d="M77 73c-9-8-16 3 0 12c16-9 9-20 0-12"/></svg></div>
+  <div class="eyebrow">ANIMA · IN YOUR POCKET</div><h1>A little closer.</h1>
+  <p class="intro">A quiet place to talk, share something,<br>and hear a familiar voice.</p>
+  <section class="connection-card" id="connectionCard">
+    <label for="address">Your computer</label><input id="address" type="url" inputmode="url" autocomplete="off" placeholder="http://192.168.1.20:8780">
+    <label for="pairCode">Pairing code</label><input id="pairCode" class="code" autocomplete="off" autocapitalize="characters" maxlength="12" placeholder="ABCD–EFGH">
+    <button id="connect" class="primary">Connect</button><p id="connectionStatus" class="hint">Open “Phone app” on the computer. Both devices use the same Wi-Fi.</p>
+  </section>
+  <section id="readyCard" class="connection-card" hidden>
+    <div class="connected"><span class="dot"></span><span id="connectedName">Your friend is here</span></div>
+    <label class="toggle-row"><span><strong>Physicalize</strong><small>Make it feel like we’re sharing the same room.</small></span><input id="physicalize" type="checkbox" role="switch"><i></i></label>
+    <button id="positionBefore" class="position-link" type="button">◎ Voice position <span id="positionSummary">Normal</span></button>
+    <button id="audioBefore" class="position-link" type="button">Audio settings <span id="audioSummary">Speaker</span></button>
+    <button id="startVisit" class="primary">Come in</button>
+    <button id="changeComputer" class="text-button">Change computer</button><p id="startStatus" class="hint"></p>
+  </section>
+  <footer>Local company. Your computer keeps the memories.</footer>
+</main>
+<main id="room" class="room" hidden>
+  <header><div class="room-avatar" aria-hidden="true">✦</div><div class="identity"><h2 id="friendName">Friend</h2><span id="presenceLabel">A visit on your phone</span></div><button id="leave" class="quiet">Leave</button></header>
+  <div id="messages" class="messages" role="log" aria-live="polite"></div>
+  <div id="uploadStatus" class="upload-status" hidden></div>
+  <section class="voice-bar"><button id="voiceToggle" class="voice-toggle"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M6 11v2a6 6 0 0 0 12 0v-2M12 19v3M9 22h6"/></svg><span>Start voice</span></button><span id="voiceStatus">Voice is off</span><button id="positionDuring" class="position-small" aria-label="Voice position">◎</button></section>
+  <section class="audio-controls"><meter id="micMeter" min="0" max="100" value="0" aria-label="Microphone level"></meter><button id="interruptReply" type="button" disabled>Interrupt</button><button id="audioDuring" type="button">Audio settings</button></section>
+  <form id="composer" class="composer"><button id="share" type="button" class="share" aria-label="Share photos or files">＋</button><textarea id="message" rows="1" placeholder="Say something…" aria-label="Message"></textarea><button id="send" type="submit" aria-label="Send message">↑</button></form>
+  <div class="room-note">Voice continues with the screen off. Stop it here or in the notification.</div>
+</main>
+<div id="toast" class="toast" role="status" hidden></div>
+<dialog id="audioDialog" class="spatial-dialog audio-dialog">
+  <div class="spatial-head"><h2>Audio settings</h2><button id="closeAudio" aria-label="Close audio settings">×</button></div>
+  <label for="audio_mode">Listening mode</label><select id="audio_mode"><option value="speaker">Speaker — prevent feedback</option><option value="headphones">Headphones — interrupt by speaking</option></select>
+  <p class="hint" id="audioModeHint"></p>
+  <label for="audio_input">Microphone</label><select id="audio_input"><option value="0">Android default</option></select><button id="refreshMicrophones" class="text-button" type="button">Refresh microphones</button>
+  <p class="hint">Choose Bluetooth microphone to activate your headset input and verify it when voice starts. LE Audio is preferred when available. Conventional Bluetooth uses hands-free audio, which can reduce playback quality. Headphones without a voice microphone can still play high-quality audio with the phone microphone.</p>
+  <p class="hint" id="audioRoute"></p>
+  <meter id="audioMeter" min="0" max="100" value="0" aria-label="Microphone test level"></meter><p id="audioMeterHint" class="hint">Start voice to check the microphone.</p>
+  <label class="range-label">Microphone sensitivity <span id="audio_sensitivityLabel"></span><input id="audio_sensitivity" type="range" min="0" max="100" value="60"></label>
+  <label class="range-label">Pause before sending <span id="audio_silenceLabel"></span><input id="audio_silence" type="range" min="500" max="2000" step="100" value="1000"></label>
+  <label class="range-label">Voice volume <span id="audio_volumeLabel"></span><input id="audio_volume" type="range" min="0" max="100" value="100"></label>
+  <h3 class="delivery-heading">Voice delivery</h3>
+  <label class="range-label">Speaking speed <span id="audio_speedLabel">90%</span><input id="audio_speed" type="range" min="75" max="110" step="5" value="90"></label>
+  <p class="hint">Slower playback preserves her pitch. 100% is the original pace.</p>
+  <label class="range-label">Whisper amount <span id="audio_whisperLabel">Soft speech</span><input id="audio_whisper" type="range" min="0" max="100" step="5" value="0"></label>
+  <p class="hint">The same speaker: soft desire at 0%, whisper at 100%. Intermediate blends are experimental; preview what sounds natural.</p>
+  <label class="range-label">Extra phrase pause <span id="audio_pauseLabel">180 ms</span><input id="audio_pause" type="range" min="0" max="600" step="20" value="180"></label>
+  <label class="range-label">Voice adherence <span id="audio_guidanceLabel">2.0</span><input id="audio_guidance" type="range" min="1" max="4" step="0.5" value="2"></label>
+  <button id="previewDelivery" class="primary">Preview delivery</button><p id="deliveryStatus" class="hint">A neutral audition; no conversation or memory is created.</p>
+  <label class="audio-check"><input id="audio_echo" type="checkbox" checked> Android echo cancellation</label>
+  <label class="audio-check"><input id="audio_noise" type="checkbox"> Android noise suppression</label>
+  <p class="hint">Device processing is optional and depends on your phone. Speaker mode prevents her playback from becoming another turn even without hardware echo cancellation.</p>
+</dialog>
+<dialog id="spatialDialog" class="spatial-dialog">
+  <div class="spatial-head"><h2>Where’s the voice?</h2><button id="closePosition" aria-label="Close positioning">×</button></div>
+  <p class="spatial-intro">Use headphones. Choose a point, then Apply. Your computer renders the ear and room cues.</p>
+  <label class="toggle-row"><span><strong>3D voice</strong><small>A little place beside you.</small></span><input id="spatialEnabled" type="checkbox" role="switch"><i></i></label>
+  <canvas id="soundSpace" width="320" height="300" tabindex="0" aria-label="Top view of voice position. Arrow keys change direction and distance."></canvas>
+  <div class="position-presets"><button data-position="left">Left ear</button><button data-position="front">In front</button><button data-position="right">Right ear</button><button data-position="back">Behind</button></div>
+  <label class="range-label">Distance from head centre <span id="distanceLabel">1.0 m</span><input id="soundDistance" type="range" min="0.11" max="3" step="0.01" value="1"></label>
+  <label class="range-label">Height <span id="heightLabel">Level</span><input id="soundHeight" type="range" min="-60" max="60" step="5" value="0"></label>
+  <label class="range-label">Room presence <span id="roomLabel">6%</span><input id="roomAmount" type="range" min="0" max="0.2" step="0.01" value="0.06"></label>
+  <label class="range-label">Head size <span id="headLabel">18 cm wide</span><input id="headRadius" type="range" min="0.075" max="0.095" step="0.005" value="0.09"></label>
+  <label for="earProfile">Ear profile</label><select id="earProfile"><option value="ku100">Neumann KU100</option><option value="sadie">SADIE II D2</option></select>
+  <button id="applyPosition" class="primary">Apply position</button><p id="positionStatus" class="hint">Applies to the next spoken reply.</p>
+  <button id="previewPosition" class="primary">Listen to voice preview</button>
+  <p class="hint">The ear presets place the source about 2 cm beside an ear. Compare the ear profiles and choose the one that sounds most natural to you.</p>
+</dialog>
+<script src="phone_audio.js"></script><script src="phone_settings.js"></script><script src="phone_spatial.js"></script><script src="phone_voice.js"></script><script src="phone_delivery.js"></script><script src="app.js"></script>
+</body></html>

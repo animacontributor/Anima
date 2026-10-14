@@ -21,6 +21,7 @@ from pathlib import Path
 import config
 import device
 import voice
+import delivery
 
 
 class VoiceError(RuntimeError):
@@ -33,6 +34,9 @@ def speech_chunks(text: str, cap: int | None = None) -> list[str]:
     text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
     text = voice.clean_for_speech(text)
     text = re.sub(r"\[(?!laugh\]|chuckle\]|sigh\]|gasp\]|cough\]|clear throat\]|sniff\])[^\]]*\]", "", text)
+    if cap is None and not getattr(config, "LIVE_VOICE_SPLIT_REPLIES", False):
+        text = re.sub(r"\s+", " ", text).strip()
+        return [text] if text else []
     cap = max(60, int(cap or getattr(config, "LIVE_VOICE_CHUNK_CHARS", 180)))
     parts = re.split(r"(?<=[.!?])\s+|\n+", text)
     chunks = []
@@ -64,35 +68,46 @@ def speech_chunks(text: str, cap: int | None = None) -> list[str]:
 
 
 class Worker:
-    def __init__(self):
+    def __init__(self, recognition_only=False):
         self.lock = threading.Lock()
+        self.recognition_only = recognition_only
+        self.recognizer = None
+        self.recognizer_lock = threading.Lock()
+        self.model_lease = None
         self.proc = None
         self.responses = queue.Queue(maxsize=8)
         self.log = None
         self.backend = None
 
     def _start(self, backend):
+        if backend not in ("chatterbox", "qwen", "kyutai"):
+            raise VoiceError("LIVE_VOICE_BACKEND must be chatterbox, qwen or kyutai.")
         if self.proc and self.proc.poll() is None and self.backend == backend:
             return
         if self.proc:
             self.close()
         custom = str(getattr(config, "LIVE_VOICE_PYTHON", "") or "")
-        home = config.ROOT / ".runtime" / "voice-env"
+        home = config.ROOT / {"qwen": ".runtime/voice-design-env", "kyutai": ".runtime/kyutai-env"}.get(backend, ".venv-voice")
         python = home / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
         if not custom and not python.is_file():
-            raise VoiceError("Voice packages are not installed yet. Run python engine/setup_voice.py.")
+            raise VoiceError("Voice packages are not installed yet. Run python engine/setup_voice.py" + ({"qwen": " --qwen", "kyutai": " --kyutai"}.get(backend, "")) + ".")
+        import voice_lock
         cmd = device.interpreter(custom) if custom else [str(python)]
         folder = config.ROOT / ".runtime"
         folder.mkdir(exist_ok=True)
-        self.log = (folder / "voice-worker.log").open("a", encoding="utf-8")
         self.responses = queue.Queue(maxsize=8)
         responses = self.responses
         try:
+            self.log = (folder / ("voice-recognizer.log" if self.recognition_only else "voice-worker.log")).open("a", encoding="utf-8")
+            self.model_lease = voice_lock.Lease("live-voice-models").acquire()
             self.proc = subprocess.Popen(cmd + ["-u", str(Path(__file__).with_name("voice_worker.py"))],
                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
                                          text=True, encoding="utf-8", cwd=str(config.ROOT),
                                          env=dict(os.environ, HF_HUB_OFFLINE="1" if getattr(config, "OFFLINE", False) else "0"),
                                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except voice_lock.Busy as e:
+            self.close()
+            raise VoiceError("Another live voice session is using the speech models. End it before opening this one.") from e
         except OSError as e:
             self.close()
             raise VoiceError(f"Could not start the voice Python: {e}") from e
@@ -112,20 +127,39 @@ class Worker:
                 responses.put({"error": "Voice worker exited; see .runtime/voice-worker.log."})
         threading.Thread(target=read, daemon=True).start()
 
+    def recognition_worker(self):
+        """An independent request pipe, so a streaming voice cannot queue STT."""
+        with self.recognizer_lock:
+            if self.recognizer is None:
+                self.recognizer = Worker(recognition_only=True)
+            return self.recognizer
+
     def request(self, op: str, on_audio=None, **data) -> dict:
+        if not self.recognition_only:
+            if op == "transcribe":
+                return self.recognition_worker().request(op, **data)
+            if op == "warmup":
+                # Warm the actual microphone lane before accepting input.
+                self.recognition_worker().request(op, **data)
         with self.lock:
-            backend = "kyutai"
+            backend = data.get("backend") or getattr(config, "LIVE_VOICE_BACKEND", "chatterbox")
             self._start(backend)
-            request = {"op": op, "id": uuid.uuid4().hex, "backend": backend,
+            ref = str(getattr(config, "LIVE_VOICE_REFERENCE", "") or "")
+            if ref and not Path(ref).is_absolute():
+                ref = str(config.ROOT / ref)
+            request = {"op": op, "id": uuid.uuid4().hex, "reference": ref, "backend": backend,
                        "device": getattr(config, "LIVE_VOICE_DEVICE", "cuda"),
-                       "stt_model": getattr(config, "LIVE_VOICE_STT_MODEL", "large-v3-turbo"),
+                       "stt_model": getattr(config, "LIVE_VOICE_STT_MODEL", "small.en"),
                        "stt_device": getattr(config, "LIVE_VOICE_STT_DEVICE", "cpu"),
-                       "stt_beam_size": getattr(config, "LIVE_VOICE_STT_BEAM_SIZE", 5),
+                       "stt_beam_size": getattr(config, "LIVE_VOICE_STT_BEAM_SIZE", 1),
                        "park_stt": bool(getattr(config, "LIVE_VOICE_PARK_STT", True)),
                        "language": getattr(config, "LIVE_VOICE_LANGUAGE", "en"),
                        "style": getattr(config, "LIVE_VOICE_KYUTAI_STYLE", "calm"),
                        "offline": bool(getattr(config, "OFFLINE", False)),
                        "vocab": f"Names: {config.USER_NAME}, {getattr(config, 'EARS_VOCAB_HINT', '')}.", **data}
+            request["recognition_only"] = self.recognition_only
+            if backend=='kyutai' and op in ('synthesize','synthesize_stream') and 'delivery' not in request:
+                request['delivery']=delivery.clean()
             if op == "transcribe":
                 hint = str(getattr(config, "LIVE_VOICE_STT_HINT", "") or "").strip()
                 if hint:
@@ -141,7 +175,16 @@ class Worker:
                         self.close()
                         raise VoiceError("Voice worker returned an out-of-order response.")
                     if result.get("event") == "audio":
-                        if on_audio and not cancelled and on_audio(result) is False:
+                        accepted = True
+                        if on_audio and not cancelled:
+                            try:
+                                accepted = on_audio(result)
+                            except Exception:
+                                # A failed consumer must not leave this job's
+                                # remaining audio in the next request's queue.
+                                self.close()
+                                raise
+                        if not cancelled and accepted is False:
                             cancelled = True
                             self.proc.stdin.write(json.dumps({"op": "cancel", "id": request["id"]}) + "\n")
                             self.proc.stdin.flush()
@@ -158,6 +201,10 @@ class Worker:
             return result
 
     def close(self):
+        with self.recognizer_lock:
+            if self.recognizer is not None:
+                self.recognizer.close()
+                self.recognizer = None
         if self.proc:
             if self.proc.poll() is None:
                 self.proc.terminate()
@@ -165,6 +212,7 @@ class Worker:
                     self.proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
+                    self.proc.wait(timeout=3)
             for stream in (self.proc.stdin, self.proc.stdout):
                 if stream:
                     stream.close()
@@ -172,6 +220,9 @@ class Worker:
         if self.log:
             self.log.close()
             self.log = None
+        if self.model_lease:
+            self.model_lease.release()
+            self.model_lease = None
 
 
 WORKER = Worker()
@@ -180,16 +231,20 @@ atexit.register(WORKER.close)
 
 class Playback:
     """One current job. Cancellation drops queued and in-flight speech results."""
-    def __init__(self, worker=None, stream=None):
+    def __init__(self, worker=None, stream=None, render_factory=None, delivery_factory=None):
         self.worker = worker or WORKER
         self.lock = threading.Lock()
         self.available = threading.Condition(self.lock)
         self.epoch = 0
         self.current = None
         self.stream = stream
+        self.render_factory = render_factory
+        self.delivery_factory = delivery_factory
 
-    def cancel(self):
+    def cancel(self, job_id=None):
         with self.lock:
+            if job_id and (not self.current or self.current["id"] != job_id or self.current["cancelled"]):
+                return None
             self.epoch += 1
             if self.current:
                 self.current["cancelled"] = True
@@ -199,9 +254,11 @@ class Playback:
 
     def start(self, text: str, epoch: int, turn: dict) -> str | None:
         parts = speech_chunks(text)
-        streaming = self.stream if self.stream is not None else True
+        streaming = self.stream if self.stream is not None else getattr(config, "LIVE_VOICE_BACKEND", "chatterbox") == "kyutai"
         if streaming:
-            parts = [" ".join(parts)] if parts else []
+            paragraphs=[' '.join(speech_chunks(p)) for p in re.split(r'\n\s*\n',text)]
+            joined='\n\n'.join(p for p in paragraphs if p)
+            parts = [joined] if joined else []
         with self.lock:
             if epoch != self.epoch:
                 return None
@@ -210,43 +267,68 @@ class Playback:
                    "streaming": streaming, "started": time.monotonic(), "first_audio_s": None}
             self.current = job
         def generate():
+            renderer = None
+            controls=None
+            def publish(audio, seconds, text=None):
+                with self.lock:
+                    while len(job['audio']) >= 3 and not job['cancelled']:
+                        self.available.wait(timeout=.1)
+                    if job['cancelled']:return False
+                    index=len(job['ready']);job['audio'][index]=audio
+                    ready={'index':index,'seconds':seconds}
+                    if text is not None:ready['text']=text
+                    job['ready'].append(ready)
+                    if job['first_audio_s'] is None:job['first_audio_s']=time.monotonic()-job['started']
+                return True
+            try:
+                controls=self.delivery_factory() if self.delivery_factory else None
+                if self.render_factory:
+                    renderer=self.render_factory()
+                    if renderer:
+                        with self.lock:job['spatial']=renderer.info
+            except Exception as e:
+                with self.lock:job['error']=str(e);job['done']=True
+                return
             for i, part in enumerate(parts):
                 with self.lock:
                     while len(job["audio"]) >= 2 and not job["cancelled"]:
                         self.available.wait(timeout=1)
                     if job["cancelled"]:
+                        if renderer:renderer.close()
                         return
                 try:
                     if streaming:
                         def receive(chunk):
                             audio = base64.b64decode(chunk["audio"], validate=True)
                             with self.lock:
-                                while len(job["audio"]) >= 3 and not job["cancelled"]:
-                                    self.available.wait(timeout=.1)
-                                if job["cancelled"]:
-                                    return False
-                                index = len(job["ready"])
-                                job["audio"][index] = audio
-                                job["ready"].append({"index": index, "seconds": chunk["seconds"]})
-                                if job["first_audio_s"] is None:
-                                    job["first_audio_s"] = time.monotonic() - job["started"]
-                            return True
-                        result = self.worker.request("synthesize_stream", text=part, on_audio=receive)
+                                if job['cancelled']:return False
+                            seconds=chunk['seconds']
+                            if renderer:audio,seconds=renderer.process(audio)
+                            return publish(audio,seconds)
+                        result = self.worker.request("synthesize_stream", text=part, on_audio=receive,**({'pcm_format':'PCM_24'} if renderer else {}),**({'delivery':controls} if controls is not None else {}))
                         # A stub/test worker may return one complete WAV.
                         if result.get("audio") and not job["ready"]:
                             receive(result)
                         continue
-                    result = self.worker.request("synthesize", text=part)
+                    result = self.worker.request("synthesize", text=part,**({'pcm_format':'PCM_24'} if renderer else {}),**({'delivery':controls} if controls is not None else {}))
                     audio = base64.b64decode(result["audio"], validate=True)
-                    with self.lock:
-                        if job["cancelled"]:
-                            return
-                        job["audio"][i] = audio
-                        job["ready"].append({"index": i, "text": part, "seconds": result["seconds"]})
+                    seconds=result['seconds']
+                    if renderer:audio,seconds=renderer.process(audio)
+                    if not publish(audio,seconds,part):
+                        if renderer:renderer.close()
+                        return
                 except Exception as e:
                     with self.lock:
                         job["error"] = str(e)
                     break
+            if renderer:
+                try:
+                    with self.lock:flush=not job['cancelled'] and not job['error']
+                    tail=renderer.finish() if flush else None
+                    if tail and tail[1]>0:publish(*tail)
+                except Exception as e:
+                    with self.lock:job['error']=str(e)
+                finally:renderer.close()
             with self.lock:
                 job["done"] = True
         if parts:
@@ -261,7 +343,7 @@ class Playback:
             return {"cancelled": job["cancelled"], "done": job["done"], "error": job["error"],
                     "chunks": [dict(p) for p in job["ready"]],
                     "total": len(job["ready"]) if job["streaming"] and job["done"] else None if job["streaming"] else len(job["parts"]),
-                    "first_audio_s": job["first_audio_s"]}
+                    "first_audio_s": job["first_audio_s"], **({'spatial':job['spatial']} if job.get('spatial') else {})}
 
     def audio(self, job_id: str, index: int) -> bytes | None:
         with self.lock:

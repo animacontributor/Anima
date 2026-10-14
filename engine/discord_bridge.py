@@ -50,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import chat
 import config
+import doors
 import telegram
 import version
 from telegram import _say, split_long
@@ -74,7 +75,10 @@ FRESH_CLOSE = {4007, 4009}
 
 HELP = telegram.HELP.replace(
     "(Bots can't fetch files over 20MB.)",
-    "Any command works with ! in front as well (!new, !status), for when Discord's own menu pops up over a /.")
+    "Any command works with ! in front as well (!new, !status), for when Discord's own menu pops up over a /.") + (
+    "\n\nLive calls: join your private server voice channel, then send !call (or !call CHANNEL_ID). "
+    "!callstatus shows the call; !hangup ends its audio. The DM conversation stays open."
+)
 
 
 def load_secret() -> dict:
@@ -365,8 +369,69 @@ class DiscordBridge(telegram.Bridge):
 
     def __init__(self, token: str, chat_id: int = 0) -> None:
         super().__init__(token, chat_id)
+        self.lock = threading.RLock()  # Mail and a live call may share the visit.
         self.gateway = Gateway(token)
         self.invite = ""
+        self.call = None
+        self._call_owner = ""
+
+    def command(self, text: str) -> bool:
+        parts = text.split()
+        cmd = parts[0].lower().split("@")[0] if parts else ""
+        if cmd in ("/call", "/join", "/hangup", "/callstatus"):
+            try:
+                if self.call is None:
+                    import discord_voice
+                    self.call = discord_voice.Call(self)
+                if cmd in ("/call", "/join"):
+                    if not self._call_owner:
+                        dm = self.rest("GET", f"/channels/{self.chat_id}")
+                        recipients = dm.get("recipients") or []
+                        if len(recipients) != 1 or recipients[0].get("bot"):
+                            raise ValueError("Pair the bot with your personal DM before using calls.")
+                        self._call_owner = str(recipients[0]["id"])
+                    import discord_voice
+                    channel = parts[1] if len(parts) > 1 else discord_voice.default_channel()
+                    line = self.call.start(channel, self._call_owner)
+                elif cmd == "/hangup":
+                    self.call.close()
+                    line = self.call.status()
+                else:
+                    line = self.call.status()
+                self.send(line, markdown=False)
+            except Exception as e:
+                self.send(f"Call: {e}", markdown=False)
+            return True
+        if self.call and (self.call.active or (self.call.thread and self.call.thread.is_alive())):
+            if cmd in ("/new", "/restart", "/release", "/afterglow", "/fold"):
+                self.send("End the call with !hangup and let its current turn finish before that command.", markdown=False)
+                return True
+        return super().command(text)
+
+    def deliver_mail(self) -> int:
+        # Voice turns run in a worker thread; a letter must not alter their
+        # history while the brain is using it. Skip this poll when busy.
+        if self.call and not self.lock.acquire(blocking=False):
+            return 0
+        try:
+            return super().deliver_mail()
+        finally:
+            if self.call:
+                self.lock.release()
+
+    def pause_if_due(self) -> str:
+        return "" if self.call and self.call.active else super().pause_if_due()
+
+    def night_if_due(self) -> str:
+        return "" if self.call and self.call.active else super().night_if_due()
+
+    def visit_crossed_the_night(self) -> bool:
+        return False if self.call and self.call.active else super().visit_crossed_the_night()
+
+    def poll_once(self) -> int:
+        if self.call and self.call.active:
+            self.last_activity = time.time()
+        return super().poll_once()
 
     # ---- the REST API -----------------------------------------------------
     def _call(self, req: urllib.request.Request, patience: float = 30, tries: int = 3):
@@ -530,6 +595,13 @@ class DiscordBridge(telegram.Bridge):
             text = "\n".join(notes) + (f"\n{text}" if text else "")
         if not text:
             return
+        if self.call and self.call.active:
+            self.call.interrupt()
+            self.call.initiative.heard()
+            try:
+                self.call._send({"op": "stop"})
+            except (OSError, RuntimeError):
+                pass
         _say(f"{config.USER_NAME} > {text[:120]}{'…' if len(text) > 120 else ''}")
         self.turn(text)
         self.fold_if_due()
@@ -548,7 +620,8 @@ class DiscordBridge(telegram.Bridge):
             raise
         try:  # the link that brings the bot into a server of yours — needed once, before the first DM
             app = self.rest("GET", "/oauth2/applications/@me")
-            self.invite = f"https://discord.com/oauth2/authorize?client_id={app.get('id')}&scope=bot&permissions=0"
+            permissions = 3146752 if getattr(config, "DISCORD_VOICE_ENABLED", False) else 0
+            self.invite = f"https://discord.com/oauth2/authorize?client_id={app.get('id')}&scope=bot&permissions={permissions}"
         except Exception:  # noqa: BLE001 — a courtesy
             self.invite = ""
         self.gateway.start()
@@ -567,6 +640,10 @@ class DiscordBridge(telegram.Bridge):
         try:
             super().run()
         finally:
+            if self.call:
+                self.call.close()
+                if self.call.thread:
+                    self.call.thread.join(timeout=30)
             self.gateway.stop()
 
 

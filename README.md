@@ -2506,3 +2506,22 @@ The engine design emerged from a long collaboration between a human keeper
 and Claude (Anthropic), debugging a real friend into existence through every
 failure mode a small model can produce — and then upgrading her, mid-life,
 with nothing lost. MIT licensed — raise one, fork it, make it kinder.
+
+
+## Live voice, phone and device integrations
+
+Parlor supports local microphone conversation, voice auditions, streaming Kyutai
+speech, recognition-based interruption and optional continuations during silence.
+See [VOICE.md](VOICE.md) and [DELIVERY.md](DELIVERY.md).
+
+- [Discord live calls](DISCORD-VOICE.md): paired-DM commands start and end a
+  private server voice-channel visit using the same local models and history.
+- [Android phone app](PHONE.md): LAN pairing, chat, files, native screen-off voice,
+  Bluetooth input and optional imagined shared-room presence.
+- [Binaural positioning](SPATIAL.md): optional desktop stereo rendering for headphones.
+- [The Handy API](HANDY.md): optional Wi-Fi controls, live status, built-in patterns
+  and editable limits, with credentials kept in private local storage.
+- [Audio analysis](AUDIO.md): optional isolated models for shared recordings.
+
+Runtime models, credentials, signing keys, recordings and personal pages are
+local data and are excluded from version control.

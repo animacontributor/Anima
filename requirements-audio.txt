@@ -1,0 +1,10 @@
+# Installed only in .runtime/audio-env; voice backend environments stay separate.
+faster-whisper>=1.2,<2
+# faster-whisper 1.2 passes metadata_errors to av.open (removed by newer PyAV).
+av>=11,<17
+numpy>=1.26,<3
+transformers>=5.6,<6
+accelerate>=1.0,<2
+librosa>=0.11,<1
+soundfile>=0.13,<1
+huggingface_hub>=1.0,<2

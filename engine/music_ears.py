@@ -32,7 +32,7 @@ import json
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -40,6 +40,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config
 import device  # before torch: on a Mac it lets a kernel MPS lacks fall back to the processor
 import os
+os.environ.setdefault("HF_HOME", str(config.ROOT / ".runtime" / "models"))
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+if getattr(config, "OFFLINE", False):
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
 if sys.platform != "win32":  # allocator hint against fragmentation (Linux-only)
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -50,21 +55,28 @@ EXIT_S = float(getattr(config, "MUSIC_EARS_EXIT_S", 1800))  # process leaves aft
 
 _lock = threading.Lock()
 _model = None
+_loaded_model_id = None
 _processor = None
 _device = "cuda"  # where _load put the model (device.pick, MUSIC_EARS_DEVICE)
 _last_used = 0.0
 
 
-def _load():
-    global _model, _processor, _device
-    if _model is not None:
+def _load(model_id=None):
+    global _model, _processor, _device, _loaded_model_id
+    model_id = model_id or MODEL_ID
+    audio_model = getattr(config, "AUDIO_EARS_MODEL", "nvidia/audio-flamingo-3-hf")
+    if model_id not in {MODEL_ID, audio_model}:
+        raise ValueError("Unknown audio model")
+    if _model is not None and _loaded_model_id == model_id:
         return
+    if _model is not None:
+        _unload()
     import torch
     from transformers import AutoProcessor
-    try:
-        from transformers import MusicFlamingoForConditionalGeneration as Cls
-    except ImportError:  # older transformers ship it under the AF3 name
+    if model_id == audio_model:
         from transformers import AudioFlamingo3ForConditionalGeneration as Cls
+    else:
+        from transformers import MusicFlamingoForConditionalGeneration as Cls
     # make room: Ollama keeps the last model resident for minutes after use,
     # and a 28GB brain beside a 16GB ear spills into system RAM (glacial).
     try:
@@ -75,15 +87,17 @@ def _load():
     except Exception:
         pass
     t0 = time.time()
-    print(f"  loading {MODEL_ID} …", flush=True)
+    print(f"  loading {model_id} …", flush=True)
 
     def _from(cls, **kw):
         # the local cache first — no Hub check, no token warning, faster start;
         # the network only for the very first download
         try:
-            return cls.from_pretrained(MODEL_ID, local_files_only=True, **kw)
+            return cls.from_pretrained(model_id, local_files_only=True, **kw)
         except Exception:
-            return cls.from_pretrained(MODEL_ID, **kw)
+            if getattr(config, "OFFLINE", False):
+                raise
+            return cls.from_pretrained(model_id, **kw)
 
     _processor = _from(AutoProcessor)
     _device = device.pick(getattr(config, "MUSIC_EARS_DEVICE", "auto"), torch)
@@ -101,6 +115,7 @@ def _load():
         attn = "default"
         _model = _from(Cls, device_map=where, dtype=dt)
     _model.eval()
+    _loaded_model_id = model_id
     # a 20-minute song is far more audio tokens than the default generation
     # length allows for; lift it so long pieces don't trip a warning each time
     try:
@@ -113,23 +128,24 @@ def _load():
 
 
 def _unload():
-    global _model, _processor
+    global _model, _processor, _loaded_model_id
     if _model is None:
         return
     import gc
     import torch
     _model = None
+    _loaded_model_id = None
     _processor = None
     gc.collect()
     device.empty_cache(_device, torch)
     print("  music ear resting — GPU freed", flush=True)
 
 
-def hear(wav_bytes: bytes, prompt: str) -> str:
+def hear(wav_bytes: bytes, prompt: str, model_id=None) -> str:
     global _last_used
     import tempfile
     with _lock:
-        _load()
+        _load(model_id)
         _last_used = time.time()
         # the processor loads audio itself from a path (16kHz mono expected)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -214,7 +230,7 @@ class Handler(BaseHTTPRequestHandler):
             wav = base64.b64decode(data.get("audio_b64") or "")
             prompt = data.get("prompt") or "Describe this music in full."
             t0 = time.time()
-            heard = hear(wav, prompt)
+            heard = hear(wav, prompt, data.get("model"))
             print(f"  heard {len(wav) / 32000:.0f}s of audio in {time.time() - t0:.0f}s", flush=True)
             self._json({"heard": heard})
         except Exception as e:
@@ -245,8 +261,8 @@ def main() -> None:
         _unload()
         return
     threading.Thread(target=_idle_watch, daemon=True).start()
-    HTTPServer.allow_reuse_address = sys.platform != "win32"  # on Windows SO_REUSEADDR lets two servers share a port (10-02)
-    server = HTTPServer((HOST, PORT), Handler)
+    ThreadingHTTPServer.allow_reuse_address = sys.platform != "win32"  # exclusive port on Windows
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"The music ear is listening at http://{HOST}:{PORT}  (model: {MODEL_ID})")
     print("It loads on the first song and rests after silence. Ctrl+C to close.")
     try:

@@ -1,110 +1,80 @@
-# Optional turn-based voice in Parlor
+# Live voice conversations
 
-Parlor can listen through the browser microphone and speak replies locally.
-Voice is **off by default**: `LIVE_VOICE_ENABLED = False`. Ordinary text chat
-requires no speech packages and starts no speech worker.
+Parlor, Discord server calls and the paired Android app use the same chat engine,
+identity, memory and tools. Speech recognition and synthesis run locally. Replies
+wait for the complete model turn; Kyutai then streams one continuous utterance.
+This is a turn-based conversation with interruption, rather than native
+speech-to-speech.
 
-## Setup
+## Install and start
 
-From the project folder, run:
+Install Python 3.12 speech dependencies with `python engine/setup_voice.py --kyutai
+--download` for the default Kyutai backend. The isolated environment is
+`.runtime/kyutai-env`. The Windows installer also prepares delivery tools.
+For Chatterbox, use `python engine/setup_voice.py --download`; for Qwen, add
+`--qwen`. Those environments are `.venv-voice` and `.runtime/voice-design-env`.
+Set `LIVE_VOICE_BACKEND` to the installed backend in `engine/config.py`, then
+restart the voice server. Package and model downloads need network access;
+`OFFLINE = True` requires cached weights.
 
-```text
-python engine/setup_voice.py --download
-```
+Open Parlor with `bat/parlor.bat` (or its `.command`/`.sh` twin), select a delivery
+style or voice sample, and press **start voice**. Pause after a phrase to submit
+it. Kyutai uses released voice embeddings; Chatterbox and Qwen can use a local
+reference WAV. References and auditions remain under `.runtime/voices/`.
+Previewing or choosing a voice does not rewrite identity or create a chat turn.
 
-The installer creates a separate Python 3.12 environment at
-`.runtime/voice-env` using uv, then installs `requirements-voice.txt`.
-It keeps packages, downloaded models and runtime logs under `.runtime/`.
-The initial installation and model download need internet access and several
-gigabytes of disk space. It does not change the engine's Python environment.
+Kyutai supports Calm, Desire, Happy, Neutral and Whisper conditions, with the
+same released speaker. See [DELIVERY.md](DELIVERY.md) for tempo, whisper blend,
+pauses and guidance. Audition scripts are `engine/kyutai_auditions.py`,
+`engine/voice_auditions.py` and `engine/qwen_voice_auditions.py`.
 
-Set `LIVE_VOICE_ENABLED = True` in `engine/config.py`, then restart Parlor.
-Click **start voice** and allow microphone access. Speak, pause for about
-one second, and listen to the reply. Speaking for a sustained interval
-interrupts playback; brief clicks do not. **Stop voice**, **leave** and
-closing the page release the microphone. Headphones help prevent speaker
-audio from being recognized as your speech.
+## Recognition, playback and interruption
 
-Use a browser with AudioWorklet and microphone support at Parlor's local
-address (`127.0.0.1`). Delivery can be changed among four released Kyutai
-voices/styles; changing it stops voice mode, then Start voice resumes it.
+The default recognizer is Whisper `large-v3-turbo`, beam size 5, on CPU/int8.
+`LIVE_VOICE_STT_DEVICE = "cuda"` uses float16 and needs additional GPU memory.
+`LIVE_VOICE_PARK_STT = True` parks CUDA recognition weights in RAM between turns,
+then restores the same model and precision. Optional vocabulary hints go in
+`LIVE_VOICE_STT_HINT`.
 
-## Models and conversation
+Recognition uses an independent persistent request pipe. Candidate microphone
+sound is transcribed while existing speech continues; only accepted words cancel
+playback and start a new turn. Rejected noise preserves the current reply and
+silence clock. Headphones permit microphone interruption; Android Speaker mode
+suppresses capture during playback. Interrupt stops output immediately. Stop
+voice, Leave and closing Parlor release the microphone.
 
-Speech recognition uses faster-whisper with `large-v3-turbo`, beam size 5.
-Recognition defaults to CPU/int8 to leave room for the brain. Set
-`LIVE_VOICE_STT_DEVICE = "cuda"` for GPU/float16 when the card has headroom.
-`LIVE_VOICE_STT_HINT` can supply uncommon names or vocabulary. The browser
-submits mono 16 kHz PCM utterances, capped at 30 seconds.
+`LIVE_VOICE_SPLIT_REPLIES = False` preserves one synthesis pass across the reply.
+Set it to `True` for independently synthesized bounded sections. Speech failures
+can retry once before audio is released; failures after output begins stop
+instead of replaying an audible prefix. Playback receipts describe delivery,
+without claiming the listener heard it.
 
-Speech uses the standalone PyTorch implementation of
-[Kyutai TTS 1.6B](https://huggingface.co/kyutai/tts-1.6b-en_fr), through
-[Moshi](https://github.com/kyutai-labs/moshi), with 32 audio codebooks.
-The default speech device is CUDA. The Windows implementation disables
-torch.compile; it does not require WSL or the complete Unmute system.
-The native Windows CUDA path has been exercised in the original local
-implementation. Other operating systems and CPU speech generation need
-real-model validation; the mocked contracts do not establish their performance.
+## Speaking during silence
 
-This is a continuous microphone with a **turn-based brain**. Each recognized
-utterance goes through the existing `chat.one_turn` path, identity, memories,
-tools and reply checks. The complete accepted reply is generated before
-speech begins; Kyutai then streams adjacent audio buffers to the browser.
-Gemma tokens are not streamed directly into the speech model.
+During an active voice visit, `LIVE_VOICE_INITIATIVE = True` permits a private
+model decision after playback completes. The first pause is sampled from a
+bounded normal distribution: default mean 25 seconds, standard deviation 6,
+bounds 5–90. The model may speak, choose another wait of 3–600 seconds, or remain
+quiet until the user speaks. There is no fixed count of successive passages.
+Silence does not establish that someone has fallen asleep.
 
-`LIVE_VOICE_THINK = None` inherits `CHAT_THINK` and its existing thought retry
-rail. Setting it to `False` disables thinking only for spoken calls. Voice
-requests retain the normal tools and reply-repair checks either way.
+New accepted words, typed input, interruption, Stop or Leave cancel pending
+choices. Capture/recognition holds late continuations; accepted words supersede
+them. Private choices stay out of visible chat and saved transcripts.
+Android uses the PC heartbeat and native foreground service, so scheduling,
+capture, delivery and completion work without WebView timers or a lit screen.
+Parlor checks through its browser; Discord waits for transport completion.
 
-Typed and spoken turns share the same Parlor visit and transcript. Playback
-receipts record completion or interruption as application metadata. They do
-not claim the speech was independently verified and do not become dialogue
-sent back to the model. The next spoken turn can acknowledge that an earlier
-written reply may not have been heard in full.
+`LIVE_VOICE_INITIATIVE_MEAN_S`, `LIVE_VOICE_INITIATIVE_STD_S` and
+`LIVE_VOICE_INITIATIVE_THINK` control the initial timing and private thinking.
+Console diagnostics are controlled by `LIVE_VOICE_INITIATIVE_LOG`,
+`LIVE_VOICE_INITIATIVE_LOG_THINKING` and `LIVE_VOICE_INITIATIVE_LOG_INTERVAL_S`.
+They can contain proposed speech and private reasons; treat console output as
+private. Duration-only performance measurements are in
+`.runtime/voice-latency.jsonl`; worker diagnostics are in
+`.runtime/voice-worker.log` and `.runtime/voice-recognizer.log`.
 
-## Resources and privacy
-
-Speech models use a separate worker. With `LIVE_VOICE_PARK_STT = True`, CUDA
-recognition weights are kept in CPU storage between utterances and restored
-to their original GPU and precision for the next recognition. CPU recognition
-is unchanged. Warmup parks the recognizer before loading the speech model,
-reducing both steady GPU use and the initial loading peak. This adds a small
-weight-transfer cost; it does not switch GPU recognition to CPU/int8.
-
-Unused PyTorch
-CUDA allocator cache is released after warmup, recognition, synthesis,
-cancellation and failures; speech-generation weights remain resident. Large Gemma
-context allocations plus GPU speech can still exceed the card's budget.
-Upstream's `EMBED_ON_CPU` setting can help leave room. These changes do not
-replace the memory store or change its embeddings.
-
-Microphone and generated audio are held in memory, not saved as recordings.
-Only recognized text and the ordinary reply enter the transcript. Existing
-Anima tools still have their normal behavior. Speech-worker diagnostics go
-to `.runtime/voice-worker.log`; latency measurements in
-`.runtime/voice-latency.jsonl` contain durations, not conversation text.
-These runtime files and model caches are ignored by Git.
-
-With `OFFLINE = True`, the worker uses cached models; install/download them
-before enabling offline mode. Restart Parlor after changing config settings.
-
-## Validation
-
-```text
-python tests/test_live_voice.py
-```
-
-The contracts stub speech models and cover audio validation, recognition
-options, cancellation, progressive playback, receipts, endpoint restrictions,
-and preserving the ordinary conversation path. They do not download models.
-
-An optional Chromium integration test uses a synthetic microphone:
-
-```text
-python -m pip install playwright
-python -m playwright install chromium
-python tests/test_voice_browser.py
-```
-
-Run the full smoke suite in an isolated checkout; it writes synthetic memory,
-journal and creation fixtures. No panel changes are included in this feature.
+One live speech front end runs at a time. Model and brain leases coordinate
+Parlor, phone, Discord and Heartbeat. Restart running processes after updating.
+See [DISCORD-VOICE.md](DISCORD-VOICE.md), [PHONE.md](PHONE.md) and
+[HANDY.md](HANDY.md) for the other integrations.

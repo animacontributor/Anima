@@ -5,16 +5,20 @@ MUSIC  — numpy measures the sound itself: tempo, loudness, dynamics, brightnes
          and the shape of the piece over time (real hearing of structure).
 
 Both degrade gracefully: if a package isn't installed, that layer reports what
-to install instead of failing. The old e4b "vibe" layer lives in ollama_client
-and is off by default (config.EARS_USE_VIBE) — it was poetic but unreliable.
+to install instead of failing. EARS_PYTHON can run transcription in an isolated
+environment. The raw-audio description layer lives in ollama_client.
 
 Install:  py -m pip install faster-whisper numpy
 """
 from __future__ import annotations
 
 import io
+import base64
+import json
 import math
 import os
+import subprocess
+import sys
 import wave
 from pathlib import Path
 
@@ -33,6 +37,25 @@ _whisper_model = None  # lazy singleton — loading takes a few seconds
 def transcribe(audio_bytes: bytes, ext: str) -> str | None:
     """Transcribe speech/lyrics. Returns None (with no side effects) if
     faster-whisper isn't installed; raises nothing."""
+    python = str(getattr(config, "EARS_PYTHON", "") or "").strip()
+    if python:
+        from device import interpreter
+        try:
+            result = subprocess.run(
+                interpreter(python) + [str(Path(__file__).resolve()), "--transcribe"],
+                input=json.dumps({"audio": base64.b64encode(audio_bytes).decode("ascii"), "ext": ext}),
+                text=True, encoding="utf-8", capture_output=True, cwd=config.ROOT,
+                timeout=600, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode:
+                return "(word-hearing failed in EARS_PYTHON; check the audio environment)"
+            return json.loads(result.stdout)["text"]
+        except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
+            return f"(word-hearing failed: {e})"
+    return _transcribe_local(audio_bytes, ext)
+
+
+def _transcribe_local(audio_bytes: bytes, ext: str) -> str | None:
     global _whisper_model
     try:
         import warnings
@@ -47,6 +70,8 @@ def transcribe(audio_bytes: bytes, ext: str) -> str | None:
             _whisper_model = WhisperModel(
                 getattr(config, "EARS_STT_MODEL", "base"),
                 device="cpu", compute_type="int8",
+                download_root=str(config.ROOT / ".runtime" / "models" / "whisper"),
+                local_files_only=bool(getattr(config, "OFFLINE", False)),
             )
         with tempfile.NamedTemporaryFile(suffix=ext or ".wav", delete=False) as f:
             f.write(audio_bytes)
@@ -167,3 +192,11 @@ def measure(wav_bytes: bytes) -> str | None:
                 f"overall color {tone}")
     except Exception as e:
         return f"(measurement failed: {e})"
+
+
+if __name__ == "__main__" and sys.argv[1:] == ["--transcribe"]:
+    import contextlib
+    request = json.load(sys.stdin)
+    with contextlib.redirect_stdout(sys.stderr):
+        text = _transcribe_local(base64.b64decode(request["audio"], validate=True), request["ext"])
+    print(json.dumps({"text": text}, ensure_ascii=False))

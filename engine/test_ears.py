@@ -1,6 +1,7 @@
-"""Ears diagnostic — finds out whether ANY channel carries audio to the model.
+"""Test the configured audio backend with a known pure tone.
 
     py engine\\test_ears.py
+    python engine/test_ears.py --ollama  (test the alternative Ollama formats)
 
 Prints: Ollama version, the ears model's declared capabilities, then tries
 each known audio request shape and shows what the model actually said.
@@ -64,6 +65,18 @@ PROMPT = "Describe exactly what you hear in this audio."
 
 
 def main() -> None:
+    if getattr(config, "EARS_BACKEND", "ollama") == "flamingo" and "--ollama" not in sys.argv:
+        print(f"audio backend: Audio Flamingo 3 ({config.AUDIO_EARS_MODEL})", flush=True)
+        audio = base64.b64encode(make_tone_wav()).decode("ascii")
+        started = time.time()
+        try:
+            answer = ollama_client.hear(audio, "wav", PROMPT)
+        except Exception as e:
+            print(f"Audio test failed: {e}", flush=True)
+            raise SystemExit(1)
+        print(answer, flush=True)
+        print(f"Completed in {time.time() - started:.1f}s. Expected: one steady tone/beep, no speech.")
+        return
     print(f"ears model:     {config.EARS_MODEL}")
     print(f"ollama version: {ollama_version()}")
     print(f"capabilities:   {model_capabilities(config.EARS_MODEL)}")
@@ -159,4 +172,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
     main()

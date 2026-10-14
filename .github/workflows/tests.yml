@@ -23,5 +23,51 @@ jobs:
         run: python -m pip install numpy
       - name: the smoke suite
         run: python tests/test_smoke.py
-      - name: optional Parlor voice contracts (speech models stubbed)
+      - name: local voice contracts (speech models stubbed)
         run: python tests/test_live_voice.py
+      - name: Discord call contracts (Discord and speech models stubbed)
+        run: python tests/test_discord_voice.py
+      - name: paired phone API and physicalize contracts
+        run: python tests/test_phone.py
+      - name: desktop DSP dependencies (no models)
+        run: python -m pip install -r requirements-spatial.txt
+      - name: stereo streaming and signal precision
+        run: python tests/test_spatial.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Discord audio timing and speech boundaries
+        run: node --test tests/test_discord_voice_audio.cjs
+      - name: phone capture and spatial coordinates
+        run: node --test tests/test_phone_audio.cjs tests/test_phone_spatial.cjs tests/test_phone_voice.cjs
+      - name: pinned Discord transport packages (no bot login)
+        run: python engine/setup_discord_voice.py
+      - name: Discord transport contracts (networking stubbed, real Opus)
+        run: node --test tests/test_discord_voice_transport.cjs
+      - name: audio routing contracts (audio models stubbed)
+        run: python tests/test_audio.py
+      - name: Handy API contracts
+        run: python -m unittest discover -s tests -p "test_handy.py"
+      - name: silence decisions
+        run: python tests/test_voice_initiative.py
+      - name: delivery settings
+        run: python tests/test_delivery.py
+      - name: thinking overrides
+        run: python tests/test_thinking.py
+      - name: phone delivery controls
+        run: node --test tests/test_phone_delivery.cjs
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: native playback and screen-off voice contracts
+        shell: bash
+        run: |
+          mkdir -p .runtime/native-contracts
+          javac -d .runtime/native-contracts android/src/local/anima/phone/PcmWave.java android/src/local/anima/phone/NativeVoicePlayback.java android/src/local/anima/phone/NativeVoiceEvents.java android/src/local/anima/phone/NativeVoiceCapture.java tests/NativePlaybackContract.java tests/NativeVoiceContract.java
+          java -cp .runtime/native-contracts local.anima.phone.NativePlaybackContract
+          java -cp .runtime/native-contracts local.anima.phone.NativeVoiceContract
+      - name: Bluetooth input routing contracts
+        env:
+          ANIMA_ANDROID_JDK: ${{ env.JAVA_HOME }}
+        run: python tests/test_bluetooth_audio_route.py

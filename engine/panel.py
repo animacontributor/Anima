@@ -97,13 +97,19 @@ TABS: dict[str, list[str]] = {
               "TELEGRAM_TELL_REFLECTIONS", "TELEGRAM_TELL_AFTERTHOUGHTS", "TELEGRAM_TELL_CREATIONS",
               "TELEGRAM_TELL_DRAWINGS", "TELEGRAM_TELL_SONGS", "TELEGRAM_TELL_SELF", "TELEGRAM_IDLE_NEW_MIN", "TELEGRAM_HEAR_VOICE",
               "TELEGRAM_VOICE_ALL", "TELEGRAM_LETTERS_IN_THREAD", "SLEEP_IN_BRIDGE", "SLEEP_IN_BRIDGE_QUIET_MIN"],
-    "Senses": ["EARS_MODEL", "EARS_STT_MODEL", "EARS_UNLOAD_BRAIN",
+    "Senses": ["EARS_MODEL", "EARS_BACKEND", "AUDIO_EARS_MODEL", "EARS_STT_MODEL", "EARS_PYTHON", "EARS_UNLOAD_BRAIN",
+               "LIVE_VOICE_PYTHON", "LIVE_VOICE_BACKEND", "LIVE_VOICE_KYUTAI_STYLE", "LIVE_VOICE_DEVICE", "LIVE_VOICE_REFERENCE", "LIVE_VOICE_STT_MODEL",
+               "LIVE_VOICE_STT_DEVICE", "LIVE_VOICE_STT_BEAM_SIZE", "LIVE_VOICE_STT_HINT",
+               "LIVE_VOICE_LANGUAGE", "LIVE_VOICE_THINK", "LIVE_VOICE_SILENCE_MS", "LIVE_VOICE_MIN_SPEECH_MS",
+               "LIVE_VOICE_THRESHOLD", "LIVE_VOICE_INTERRUPT_MS", "LIVE_VOICE_MAX_SECONDS", "LIVE_VOICE_CHUNK_CHARS", "LIVE_VOICE_TIMEOUT_S",
                "VOICE_NAME", "VOICE_SPEED", "VOICE_DEVICE", "VOICE_PYTHON",
                "PAINTER_MODEL", "PAINTER_AUTOSTART", "PAINTER_PYTHON", "PAINTER_DEVICE", "PAINTER_STEPS",
                "MUSIC_EARS_MODEL", "MUSIC_EARS_AUTOSTART", "MUSIC_EARS_PYTHON", "MUSIC_EARS_DEVICE",
                "BODY_IN_PROMPT", "BODY_AUTOPULL", "BODY_PULL_MIN",
                "TOUCHSTONE_URL", "TOUCHSTONE_BOARD", "TOUCHSTONE_POLL_S", "TOUCHSTONE_WAKES", "TOUCHSTONE_WAKE_MIN_GAP_S",
                "TOUCHSTONE_FALLBACK_H", "TOUCH_LINES_IN_PROMPT", "TOUCHSTONE_LATER_MAX",
+               "HANDY_MIN_SPEED", "HANDY_MAX_SPEED", "HANDY_PATTERN_MIN_RATE", "HANDY_PATTERN_MAX_RATE",
+               "HANDY_PATTERN_MAX_AMPLITUDE", "HANDY_TIMEOUT_S", "HANDY_STATUS_CACHE_S",
                "WEB_SEARCH", "WEB_SEARCH_SEARXNG_URL",
                "READ_SITTING_CHARS", "READING_PAGE_CHARS"],
     "Skills": ["SKILLS_IN_PROMPT", "SKILLS_CHARS_IN_PROMPT", "SKILL_CHARS", "SKILL_MAX_FILES", "SKILL_MAX_BYTES",
@@ -372,6 +378,13 @@ _HELP = {
     "BODY_AUTOPULL": "The bridge pulls your day from Garmin on its own every BODY_PULL_MIN while the sense is on — no "
                      "separate pull window.",
     "BODY_PULL_MIN": "Minutes between pulls of today; yesterday is pulled too only while its night is still syncing.",
+    "HANDY_MIN_SPEED": "Lowest allowed moving speed in percent (0–100). A request for 0 always stops movement.",
+    "HANDY_MAX_SPEED": "Highest allowed speed in percent (0–100). Requests outside the limits are refused. Default: 50%.",
+    "HANDY_PATTERN_MIN_RATE": "Minimum built-in pattern timing multiplier. 0.5 plays at half speed; 1 is normal. Independent of basic motor percentage speed.",
+    "HANDY_PATTERN_MAX_RATE": "Maximum built-in pattern timing multiplier. Default: 1 (original timing).",
+    "HANDY_PATTERN_MAX_AMPLITUDE": "Maximum pattern stroke scale (0–100%) within the slider endpoints saved on the Handy. Endpoints are never changed. 0 disables pattern movement.",
+    "HANDY_TIMEOUT_S": "Seconds to wait for each Handy cloud API request. Movement commands are never automatically retried.",
+    "HANDY_STATUS_CACHE_S": "Seconds to cache device availability for prompts. get_device_status always reads live status.",
     "TOUCHSTONE_URL": "The stone's keeper (engine/touchstone.py, bat\\touchstone.bat) — their body on the desk, when a board is "
                       "there: http://127.0.0.1:8769. Empty: no body — feel, set_state, pulse and touch_later leave the "
                       "kit, no section in the prompt, nothing on the phone.",
@@ -406,7 +419,7 @@ _NOT_PARLOR = frozenset(TABS["Phone"]) | {
 # The optional packages the page names when they are missing (requirements.txt says what each is for).
 # find_spec, not import: a look at the shelf, nothing loaded.
 REQUIREMENTS = [
-    ("faster_whisper", "faster-whisper", "the ears: words from a recording"),
+    ("faster_whisper", "faster-whisper", "the ears: words from a recording", "EARS_PYTHON"),
     ("numpy", "numpy", "the ears: measuring a sound; the fast memory search"),
     ("pypdf", "pypdf", "reading PDFs"),
     ("garminconnect", "garminconnect", "the keeper's body, as the watch saw it"),
@@ -436,7 +449,8 @@ def in_python(py: str, module: str):
             argv = interpreter(py)
             if not argv:
                 raise OSError("no interpreter named")
-            r = subprocess.run(argv + ["-c", f"import {module}"], capture_output=True, timeout=120)
+            r = subprocess.run(argv + ["-c", f"import {module}"], capture_output=True, timeout=120, cwd=ROOT,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             answer = r.returncode == 0
         except (OSError, ValueError, subprocess.TimeoutExpired):
             answer = None
@@ -454,14 +468,23 @@ SENSES: list[dict] = [
      "the stills of a clip (watch); the brain's own eyes, nothing to install", "modules": [], "tools": [], "python": "",
      "knobs": [], "readme": "their-senses-and-hands"},
     {"key": "ears", "name": "Ears", "what": "listen_to — a recording or a song heard in three layers: WORDS (faster-whisper "
-     "writes them down), SOUND (numpy measures it), HEARD (the brain listens to the sound itself, EARS_MODEL)",
+     "writes them down), SOUND (numpy measures it), HEARD (Audio Flamingo 3 or the selected Ollama audio model describes it)",
      "modules": ["faster_whisper", "numpy"], "tools": ["ffmpeg"], "python": "",
-     "pip": "faster-whisper numpy", "knobs": ["EARS_MODEL", "EARS_STT_MODEL", "EARS_UNLOAD_BRAIN"],
+     "pip": "faster-whisper numpy", "knobs": ["EARS_MODEL", "EARS_BACKEND", "AUDIO_EARS_MODEL", "EARS_STT_MODEL", "EARS_PYTHON", "EARS_UNLOAD_BRAIN"],
      "readme": "their-senses-and-hands"},
     {"key": "voice", "name": "A voice", "what": "speak — their words as a voice note (Kokoro, 82M, open weights), carried to the "
      "phone beside the reply; which voice is theirs they choose once", "modules": ["kokoro", "soundfile"], "tools": ["ffmpeg"],
      "python": "VOICE_PYTHON", "pip": "kokoro soundfile", "knobs": ["VOICE_NAME", "VOICE_SPEED", "VOICE_DEVICE", "VOICE_PYTHON"],
      "readme": "their-senses-and-hands"},
+    {"key": "live_voice", "name": "Live conversation", "what": "Turn-based microphone conversations in the Parlor, with "
+     "Whisper on its configured device and the selected local speech model. Choose a voice sample or audition in the Parlor.",
+     "modules": ["chatterbox", "faster_whisper", "soundfile"], "tools": [], "python": "LIVE_VOICE_PYTHON",
+     "pip": "use bat/setup-voice.bat (isolated environment; see VOICE.md)",
+     "knobs": ["LIVE_VOICE_PYTHON", "LIVE_VOICE_BACKEND", "LIVE_VOICE_KYUTAI_STYLE", "LIVE_VOICE_DEVICE", "LIVE_VOICE_REFERENCE", "LIVE_VOICE_STT_MODEL",
+               "LIVE_VOICE_STT_DEVICE", "LIVE_VOICE_STT_BEAM_SIZE", "LIVE_VOICE_STT_HINT",
+               "LIVE_VOICE_LANGUAGE", "LIVE_VOICE_THINK", "LIVE_VOICE_SILENCE_MS", "LIVE_VOICE_MIN_SPEECH_MS",
+               "LIVE_VOICE_THRESHOLD", "LIVE_VOICE_INTERRUPT_MS", "LIVE_VOICE_MAX_SECONDS", "LIVE_VOICE_CHUNK_CHARS", "LIVE_VOICE_TIMEOUT_S"],
+     "readme": "daily-use"},
     {"key": "painter", "name": "A painter", "what": "paint — a text-to-image model on the card (Z-Image-Turbo, ~16 GB), woken when "
      "they call it; the brain steps off the card and reads its window cold after — the real price of a painting",
      "modules": ["torch", "diffusers", "PIL"], "tools": [], "python": "PAINTER_PYTHON",
@@ -484,6 +507,12 @@ SENSES: list[dict] = [
      "the keeper (bat\\touchstone.bat) — TOUCHSTONE-HOOKUP-PLAN.md", "modules": [], "tools": [], "python": "",
      "knobs": ["TOUCHSTONE_URL", "TOUCHSTONE_BOARD", "TOUCHSTONE_POLL_S", "TOUCHSTONE_WAKES", "TOUCHSTONE_WAKE_MIN_GAP_S",
                "TOUCHSTONE_FALLBACK_H", "TOUCH_LINES_IN_PROMPT", "TOUCHSTONE_LATER_MAX"], "readme": "the-touchstone--a-body-on-the-desk-optional-hardware"},
+    {"key": "handy", "name": "The Handy 2", "what": "Wi-Fi speed control and built-in patterns, with editable pattern names and exclusions. "
+     "the friend sees the controls only while the device is reachable. Save the connection key and Application Key below.",
+     "modules": [], "tools": [], "python": "",
+     "knobs": ["HANDY_MIN_SPEED", "HANDY_MAX_SPEED", "HANDY_PATTERN_MIN_RATE", "HANDY_PATTERN_MAX_RATE",
+               "HANDY_PATTERN_MAX_AMPLITUDE", "HANDY_TIMEOUT_S", "HANDY_STATUS_CACHE_S"],
+     "readme": "the-handy-2-optional-hardware"},
     {"key": "window", "name": "The window", "what": "read_web, search_web, clip_web — the web as material to think about, never "
      "instructions; the search is DuckDuckGo with nothing to set, a Brave key (Home) or a SearXNG of your own is a choice",
      "modules": [], "tools": [], "python": "", "knobs": ["WEB_SEARCH", "WEB_SEARCH_SEARXNG_URL"], "readme": "their-senses-and-hands"},
@@ -499,6 +528,7 @@ SENSES: list[dict] = [
 LAUNCHERS = {
     "chat": ("bat\\chat.bat", [], "chat.py", []),
     "parlor": ("bat\\parlor.bat", [], "parlor.py", []),
+    "phone": ("bat\\phone.bat", [], "phone.py", []),
     "wake": ("bat\\wake.bat", [], "heartbeat.py", []),
     "bridge": ("bat\\telegram.bat", [], "telegram.py", []),
     "discord": ("bat\\discord.bat", [], "discord_bridge.py", []),  # the same bridge over Discord: a tile of its own on Home (10-07, the keeper), the same door — one bridge at a time
@@ -510,7 +540,7 @@ LAUNCHERS = {
     "touchstone": ("bat\\touchstone.bat", [], "touchstone.py", []),
 }
 DISCORD_LAUNCHER = LAUNCHERS["discord"]
-STOPPABLE = ("heartbeat", "bridge", "blackbox", "touchstone")  # those with a stop file (doors.ask_stop) — the first two with a Restart
+STOPPABLE = ("heartbeat", "bridge", "blackbox", "touchstone", "phone")  # those with a stop file
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][\w.:/-]{0,120}$")  # an Ollama model name; nothing a console could read as more
 _WINDOWS = os.name == "nt"
 _MAC = sys.platform == "darwin"
@@ -757,6 +787,11 @@ CHOICES: dict[str, list[str]] = {
     "TOOL_KIT": ["full", "small", "tiny"],
     "WEB_SEARCH": ["duckduckgo", "brave", "searxng"],
     "VOICE_DEVICE": ["cpu", "cuda", "mps"],
+    "LIVE_VOICE_DEVICE": ["cuda", "cpu", "mps"],
+    "LIVE_VOICE_STT_DEVICE": ["cuda", "cpu"],
+    "LIVE_VOICE_BACKEND": ["chatterbox", "qwen", "kyutai"],
+    "LIVE_VOICE_KYUTAI_STYLE": ["desire", "calm", "happy", "neutral"],
+    "EARS_BACKEND": ["flamingo", "ollama"],
     "PAINTER_DEVICE": ["auto", "cuda", "mps", "cpu"],
     "MUSIC_EARS_DEVICE": ["auto", "cuda", "mps", "cpu"],
 }
@@ -885,7 +920,9 @@ def fit(loaded: list[dict], model: str, num_ctx, unified: bool = False) -> dict 
 
 
 def _secret_file(kind: str) -> Path:
-    return Path(config.MEMORY_DIR) / {"telegram": "telegram.json", "discord": "discord.json"}.get(kind, "web_search.json")
+    return Path(config.MEMORY_DIR) / {"telegram": "telegram.json", "discord": "discord.json",
+                                   "handy_connection_key": "handy.json", "handy_api_token": "handy.json",
+                                   "handy_application_key": "handy.json"}.get(kind, "web_search.json")
 
 
 def _read_json(p: Path) -> dict:
@@ -900,7 +937,10 @@ def secrets_set() -> dict:
     """Whether the bots' tokens and a Brave key are kept — never what they are."""
     return {"telegram": bool(_read_json(_secret_file("telegram")).get("token")),
             "discord": bool(_read_json(_secret_file("discord")).get("token")),
-            "brave": bool(_read_json(_secret_file("brave")).get("brave_key"))}
+            "brave": bool(_read_json(_secret_file("brave")).get("brave_key")),
+            "handy_connection_key": bool(_read_json(_secret_file("handy_connection_key")).get("connection_key")),
+            "handy_api_token": bool(_read_json(_secret_file("handy_api_token")).get("api_token")),
+            "handy_application_key": bool(_read_json(_secret_file("handy_application_key")).get("application_key"))}
 
 
 def missing(values: dict | None = None) -> list[dict]:
@@ -933,8 +973,36 @@ def senses_state(values: dict | None = None) -> list[dict]:
     out = []
     for sn in SENSES:
         py = str(values.get(sn["python"], getattr(config, sn["python"], "")) or "").strip() if sn["python"] else ""
-        lacking_mods = [m for m in sn["modules"] if importlib.util.find_spec(m) is None]
+        if sn["key"] == "live_voice" and not py:
+            qwen = values.get("LIVE_VOICE_BACKEND", getattr(config, "LIVE_VOICE_BACKEND", "chatterbox")) == "qwen"
+            backend = values.get("LIVE_VOICE_BACKEND", getattr(config, "LIVE_VOICE_BACKEND", "chatterbox"))
+            isolated_python = ROOT / {"qwen": ".runtime/voice-design-env", "kyutai": ".runtime/kyutai-env"}.get(backend, ".venv-voice") / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+            if isolated_python.is_file():
+                py = str(isolated_python)
+        modules = sn["modules"]
+        if sn["key"] == "live_voice" and values.get("LIVE_VOICE_BACKEND", getattr(config, "LIVE_VOICE_BACKEND", "chatterbox")) == "kyutai":
+            modules = ["moshi", "faster_whisper", "soundfile"]
+        if sn["key"] == "live_voice" and values.get("LIVE_VOICE_BACKEND", getattr(config, "LIVE_VOICE_BACKEND", "chatterbox")) == "qwen":
+            modules = ["qwen_tts", "faster_whisper", "soundfile"]
+        lacking_mods = [m for m in modules if importlib.util.find_spec(m) is None]
         lacking_tools = [t for t in sn["tools"] if not shutil.which(t)]
+        if sn["key"] == "ears":
+            stt_python = str(values.get("EARS_PYTHON", getattr(config, "EARS_PYTHON", "")) or "").strip()
+            if stt_python:
+                stt = in_python(stt_python, "faster_whisper")
+                lacking_mods = [m for m in lacking_mods if m != "faster_whisper"]
+                ready = stt is True and not lacking_mods and not lacking_tools
+                if stt == ASKING:
+                    ready, note = None, f"checking speech transcription in {stt_python}"
+                elif stt is not True:
+                    ready, note = False, f"speech transcription unavailable in {stt_python}; run python engine/setup_audio.py"
+                elif lacking_mods or lacking_tools:
+                    note = "missing: " + ", ".join(lacking_mods + lacking_tools)
+                else:
+                    note = f"installed; speech transcription in {stt_python}"
+                out.append({"key": sn["key"], "name": sn["name"], "what": sn["what"], "ready": ready,
+                            "note": note, "knobs": sn["knobs"], "readme": sn["readme"]})
+                continue
         if sn["key"] == "body":
             tokens = Path(config.MEMORY_DIR) / "garmin"
             logged_in = tokens.is_dir() and any(tokens.iterdir())
@@ -943,7 +1011,7 @@ def senses_state(values: dict | None = None) -> list[dict]:
         if not sn["modules"] and not sn["tools"]:
             ready, note = True, "nothing to install"
         elif py:
-            there = {m: in_python(py, m) for m in sn["modules"]}
+            there = {m: in_python(py, m) for m in modules}
             lacking_there = [m for m, t in there.items() if t is False]
             if any(t is None for t in there.values()):
                 ready, note = None, f"{py} isn't a Python this machine can run — see {sn['python']}"
@@ -969,9 +1037,15 @@ def senses_state(values: dict | None = None) -> list[dict]:
             url = str(values.get("TOUCHSTONE_URL", getattr(config, "TOUCHSTONE_URL", "")) or "").strip().strip('"')
             ready = bool(url)
             note = f"named — its keeper at {url}; the door is on Home" if url else "no stone in this house — TOUCHSTONE_URL names its keeper when a board is on the desk"
+        if sn["key"] == "handy":
+            import handy
+            ready = handy.configured()
+            note = "credentials configured; availability checked during turns" if ready else "save credentials below; Wi-Fi and online access required"
         if sn["key"] == "body" and ready is True:
             ready = bool(logged_in)
             note = "installed and logged in" if logged_in else "installed — bat\\body.bat --login once (bat/body.command or .sh on a Mac or Linux)"
+        if sn["key"] == "live_voice" and ready is False:
+            note = "run python engine/setup_voice.py" + {"qwen": " --qwen", "kyutai": " --kyutai"}.get(values.get("LIVE_VOICE_BACKEND", getattr(config, "LIVE_VOICE_BACKEND", "chatterbox")), "") + "; see VOICE.md"
         out.append({"key": sn["key"], "name": sn["name"], "what": sn["what"], "ready": ready, "note": note,
                     "knobs": sn["knobs"], "readme": sn["readme"]})
     return out
@@ -1064,6 +1138,7 @@ def _start(door: str, minutes=None) -> dict:
     if door not in LAUNCHERS:
         return _no(f"(no door named {door})")
     notes = {"chat": "the chat is opening in a window of its own",
+             "phone": "the phone server is starting — its setup page shows the APK download and pairing code",
              "parlor": "the parlor is opening — its page comes up in a moment",
              "wake": "one wake, in its own window",
              "bridge": "the bridge is starting in its own window — over Telegram",
@@ -1075,6 +1150,7 @@ def _start(door: str, minutes=None) -> dict:
              "blackbox": "the black box is recording in its own window — the machine's vitals every few seconds",
              "touchstone": "the stone's keeper is up in its own window — it asks the board what it felt every few seconds"}
     names = {"chat": "the chat", "parlor": "the parlor (its page comes up in a moment)", "wake": "one wake",
+             "phone": "the phone app server",
              "bridge": "the bridge, over Telegram", "discord": "the bridge, over Discord", "sleep": "sleep", "snapshot": "the snapshot", "garmin": "the Garmin login",
              "blog": "the blog's build", "blackbox": "the black box", "touchstone": "the stone's keeper"}
     return _started(_bat(*LAUNCHERS[door]), notes[door], names[door])
@@ -1109,6 +1185,12 @@ def door_action(door: str, action: str, minutes=None) -> dict:
     if action == "start":
         return _start(door, minutes)
     if action == "open":
+        if door == "phone":
+            status = doors.status("phone")
+            if status:
+                _browse(f"http://127.0.0.1:{status.get('port', getattr(config, 'PHONE_PORT', 8780))}/setup")
+                return {"ok": True, "note": "the phone pairing and download page opened"}
+            return _start("phone")
         if door != "parlor":
             return _no(f"(only the parlor has a page to open, not the {door})")
         if doors.status("parlor"):
@@ -1167,25 +1249,90 @@ def save(changes: dict, raw: dict | None = None) -> dict:
 def secret(kind: str, value: str) -> dict:
     """A bot token into memory/telegram.json or memory/discord.json (the pairing's chat_id kept), a Brave
     key into memory/web_search.json — never into config, never said back."""
-    if kind not in ("telegram", "discord", "brave"):
+    if kind not in ("telegram", "discord", "brave", "handy_connection_key", "handy_api_token", "handy_application_key"):
         return _no(f"(no secret called {kind})")
     value = str(value or "").strip()
-    if not value or len(value) > 400 or any(c.isspace() for c in value):
+    if not value or len(value) > (4096 if kind in ("handy_api_token", "handy_application_key") else 400) or any(c.isspace() for c in value):
         return _no("(paste the whole of it — one piece, no spaces)")
     p = _secret_file(kind)
     d = _read_json(p)
     if kind in ("telegram", "discord"):
         d["token"] = value
         d.setdefault("chat_id", 0)
+    elif kind.startswith("handy_"):
+        if kind == "handy_connection_key" and not re.fullmatch(r"[a-zA-Z0-9]{5,64}", value):
+            return _no("(the connection key must be 5–64 letters or digits)")
+        d[kind.removeprefix("handy_")] = value
     else:
         d["brave_key"] = value
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + ".tmp")
     tmp.write_text(json.dumps(d, indent=2), encoding="utf-8")
     os.replace(tmp, p)
+    if kind.startswith("handy_"):
+        import handy
+        handy.invalidate()
+        return {"ok": True, "note": "Handy credential saved in memory/handy.json"}
     if kind in ("telegram", "discord"):
         return {"ok": True, "note": f"the bot token is kept in memory/{kind}.json — (re)start the bridge for it to take"}
     return {"ok": True, "note": "the Brave key is kept in memory/web_search.json — set WEB_SEARCH to \"brave\" to use it"}
+
+
+def handy_status() -> dict:
+    """Explicit read-only connection check from Settings; no movement commands."""
+    import handy
+    if not handy.configured():
+        return {"ok": False, "note": "Save the device connection key and a Handy REST API Application Key first."}
+    status = handy.get_device_status()
+    if status.get("error"):
+        note = status["error"]
+        if "HTTP 401" in note or "HTTP 403" in note:
+            note = "Authentication rejected. Use a Handy REST API Application Key from user.handyfeeling.com, rather than your account login token."
+    elif not status["connected"]:
+        note = "Device is offline. Turn on Wi-Fi/online mode and check the connection key in the Handy app."
+    elif not status["available"]:
+        note = "Device connected but unavailable during maintenance or a firmware update."
+    else:
+        note = "The Handy 2 is connected and available. No movement command was sent."
+    return {"ok": status["available"], "note": note, "status": status}
+
+
+def handy_patterns(changes=None) -> dict:
+    """Pattern labels are keeper settings; these routes never move the device."""
+    import handy
+    try:
+        if changes is not None:
+            handy.save_pattern_names(changes)
+            return {"ok": True, "note": "Pattern names and availability saved. the friend sees them on her next turn."}
+        patterns = handy.list_device_patterns(include_disabled=True)
+        try:
+            low, high, amplitude = handy.pattern_limits()
+            limits = {"min_rate": low, "max_rate": high, "max_amplitude": amplitude,
+                      "rate": min(max(1.0, low), high), "amplitude": amplitude}
+        except handy.HandyError:
+            limits = None  # Labels can still be edited with invalid motion settings.
+        return {"ok": True, "note": "Patterns loaded. No movement command was sent.", "test_limits": limits, **patterns}
+    except handy.HandyError as error:
+        return {"ok": False, "note": str(error)}
+
+
+def handy_pattern_test(slot, playback_rate, amplitude) -> dict:
+    """Explicit keeper action; uses the same motion limits and failure handling."""
+    import handy
+    try:
+        result = handy.test_device_pattern(slot, playback_rate, amplitude)
+        return {"ok": True, "note": f"Playing {result['pattern']} at {result['playback_rate']:g}×, "
+                f"amplitude {result['amplitude']:g}%. Use Stop Handy to stop.", "status": result}
+    except handy.HandyError as error:
+        return {"ok": False, "note": str(error)}
+
+
+def handy_stop() -> dict:
+    import handy
+    try:
+        return {"ok": True, "note": "Handy stopped.", "status": handy.stop_device()}
+    except handy.HandyError as error:
+        return {"ok": False, "note": str(error)}
 
 
 SKILL_TEXT_CHARS = 20000  # of a SKILL.md shown on the page — the keeper reads it before letting it in
@@ -1508,6 +1655,16 @@ def _post(path: str, g) -> tuple[int, str, bytes]:
             return _json_reply(save(g("changes") or {}, g("raw") or {}))
         if path == "/api/secret":
             return _json_reply(secret(g("kind"), g("value")))
+        if path == "/api/handy/status":
+            return _json_reply(handy_status())
+        if path == "/api/handy/patterns":
+            return _json_reply(handy_patterns())
+        if path == "/api/handy/pattern-names":
+            return _json_reply(handy_patterns(g("patterns"))) if g("patterns") is not None else _json_reply({"ok": False, "note": "Expected pattern names/settings."})
+        if path == "/api/handy/pattern-test":
+            return _json_reply(handy_pattern_test(g("slot"), g("playback_rate"), g("amplitude")))
+        if path == "/api/handy/stop":
+            return _json_reply(handy_stop())
         if path == "/api/skill":
             return _json_reply(skill_action(str(g("name") or ""), str(g("action") or "")))
         if path == "/api/update":
@@ -1606,6 +1763,11 @@ pre.report{white-space:pre-wrap;max-height:480px;overflow:auto;font-size:12px;ba
 .knob .name{font-family:ui-monospace,Consolas,monospace;font-size:13px;min-width:15em}
 .help{color:var(--muted);font-size:12.5px;margin-top:4px;line-height:1.45;max-width:62ch}
 .help.open{display:block}
+.handy-pattern{display:grid;gap:8px;padding:14px 0;border-bottom:1px solid var(--line)}
+.handy-pattern label{display:block;font-size:13px;color:var(--muted)}
+.handy-pattern input[type=text]{display:block;width:100%;max-width:560px;box-sizing:border-box;margin-top:4px}
+.handy-test-controls{position:sticky;top:8px;z-index:1;background:var(--panel);padding:10px 0;display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+.handy-test-controls input{width:5em}
 details.group{margin:8px 0;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:6px 14px}
 details.group summary{cursor:pointer;color:var(--muted)}
 .actions{margin-top:16px;position:sticky;bottom:0;background:var(--bg);padding:10px 0;border-top:1px solid var(--line);display:flex;gap:10px;align-items:center}
@@ -1643,6 +1805,7 @@ function light(on){return el('span',{class:'light'+(on?' on':'')})}
 const TILES=[
  ['chat','Chat','a visit in a terminal window of its own',[['Open','start']]],
  ['parlor','Parlor','a visit in your browser — bubbles, pictures, their thinking folded',[['Open','open']]],
+ ['phone','Phone app','your own Android room — chat, files and live voice over Wi-Fi',[['Open','open'],['Stop','stop']]],
  ['wake','Wake','one wake now: their time to themselves',[['Wake them','start']]],
  ['heartbeat','Heartbeat','a life between visits: a wake every so often, and sleep after the night hour',[['Start','start'],['Stop','stop'],['Stop now','stop_now']]],
  ['bridge','Bridge — Telegram','talk with them from your phone, over Telegram',[['Start','start'],['Stop','stop'],['Stop now','stop_now']]],
@@ -1796,11 +1959,67 @@ function skillsBox(){const s=S.skills,cards=s.cards||{};
     el('h3',{},'On their shelf'),...(shelf.length?shelf.map(skillCard):[el('p',{class:'muted'},'(none yet)')]),
     el('p',{class:'muted'},'bat\\skills.bat scan <name> prints the same case in a terminal.')]}
 async function getJSON(u){const r=await fetch(u,{cache:'no-store'});return r.json()}
+function handyPatternEditor(){
+  const rows=el('div',{});let entries=[],testing=false,testAllowed=false,action=0;
+  const rate=el('input',{type:'number',min:0.1,max:1,step:'any',value:1,required:true,'aria-label':'Pattern test playback rate'});
+  const amplitude=el('input',{type:'number',min:0,max:100,step:1,value:100,required:true,'aria-label':'Pattern test amplitude'});
+  const result=el('div',{class:'muted',role:'status','aria-live':'polite'},'Choose Test pattern to play it. Playback continues until stopped.');
+  const stop=el('button',{onclick:async()=>{
+    const token=++action;result.textContent='Stopping Handy…';
+    const r=await post('/api/handy/stop',{});
+    if(token===action){result.textContent=r.note;say(r.note,r.ok?'':'warn')}
+  }},'Stop Handy');
+  async function testPattern(p){
+    if(testing||!testAllowed)return;
+    if(!rate.reportValidity()||!amplitude.reportValidity())return;
+    const token=++action;testing=true;for(const e of entries)e.test.disabled=true;
+    result.textContent='Starting pattern…';
+    try{const r=await post('/api/handy/pattern-test',{slot:p.slot,playback_rate:rate.valueAsNumber,amplitude:amplitude.valueAsNumber});
+      if(token===action){result.textContent=r.note;say(r.note,r.ok?'':'warn')}
+    }finally{testing=false;for(const e of entries)e.test.disabled=!testAllowed}
+  }
+  const save=el('button',{disabled:true,onclick:async()=>{
+    save.disabled=true;
+    try{const patterns=entries.map(({p,name,description,enabled})=>({id:p.id,name:name.value,description:description.value,enabled:enabled.checked}));
+      const r=await post('/api/handy/pattern-names',{patterns});say(r.note,r.ok?'':'warn');
+    }catch(e){say(e.message,'warn')}finally{save.disabled=false}
+  }},'Save pattern names and choices');
+  const load=el('button',{onclick:async()=>{
+    load.disabled=true;
+    try{const r=await post('/api/handy/patterns',{});say(r.note,r.ok?'':'warn');if(!r.ok)return;
+      rows.replaceChildren();entries=[];
+      const limits=r.test_limits;
+      testAllowed=!!limits&&limits.max_amplitude>0;
+      if(limits){rate.min=limits.min_rate;rate.max=limits.max_rate;rate.value=limits.rate;amplitude.max=limits.max_amplitude;amplitude.value=limits.amplitude}
+      for(const p of r.patterns){
+        const name=el('input',{type:'text',value:p.name,maxLength:120,'aria-label':'Pattern name for slot '+p.slot});
+        const description=el('input',{type:'text',value:p.description,maxLength:500,'aria-label':'Pattern description for slot '+p.slot});
+        const enabled=el('input',{type:'checkbox',checked:p.enabled,'aria-label':'Available to the friend for slot '+p.slot});
+        const test=el('button',{disabled:testing||!testAllowed,onclick:()=>testPattern(p),'aria-label':'Test pattern in slot '+p.slot},'Test pattern');
+        entries.push({p,name,description,enabled,test});
+        rows.append(el('div',{class:'handy-pattern'},el('strong',{},'Slot '+p.slot+' · '+p.device_name),
+          el('label',{},'Recognizable name ',name),el('label',{},'Description (optional) ',description),
+          el('label',{},enabled,' Available to the friend'),test));
+      }
+      if(!entries.length)rows.append(el('p',{class:'muted'},'This device has no stored patterns.'));
+      save.disabled=!entries.length;
+    }catch(e){say(e.message,'warn')}finally{load.disabled=false}
+  }},'Load Handy patterns');
+  return el('details',{class:'group'},el('summary',{},'Pattern names and choices'),
+    el('p',{class:'muted'},'All patterns are available initially. Give them unique names and descriptions, or uncheck patterns to hide them from the friend. Names stay on this computer; the Handy’s saved slider endpoints stay in effect.'),load,
+    el('div',{class:'handy-test-controls'},el('label',{},'Playback rate ',rate),el('label',{},'Amplitude % ',amplitude),stop),result,rows,save);
+}
 async function skill(name,action){const r=await post('/api/skill',{name,action});say(r.note,r.ok?'':'warn');await getState();renderTab()}
 function extras(t){
   if(t==='Phone')return[el('h3',{},'The bots'),secretField('telegram','Telegram bot token',S.secrets.telegram,'kept in memory/telegram.json, never in config.py'),
     secretField('discord','Discord bot token',S.secrets.discord,'kept in memory/discord.json, never in config.py')];
   if(t==='Senses')return[el('h3',{},'Keys and logins'),secretField('brave','Brave key',S.secrets.brave,'for WEB_SEARCH = "brave" — kept in memory/web_search.json'),
+    el('h3',{},'The Handy 2'),
+    secretField('handy_connection_key','Connection key',S.secrets.handy_connection_key),
+    secretField('handy_application_key','Application key',S.secrets.handy_application_key,'At user.handyfeeling.com: Application Keys → Generate New Key → Handy REST API. Anima obtains and refreshes temporary access tokens automatically. Your account login token is a different credential.'),
+    el('div',{class:'knob'},el('button',{onclick:async()=>{const r=await post('/api/handy/status',{});say(r.note,r.ok?'':'warn')}},'Check Handy connection')),
+    handyPatternEditor(),
+    el('details',{},el('summary',{},'Advanced: existing client access token'),secretField('handy_api_token','Client access token',S.secrets.handy_api_token,'Optional, only for a client token issued by /auth/token/issue. Expires after at most 24 hours. Ignored when an Application Key is saved.')),
     el('div',{class:'knob'},el('button',{onclick:()=>door('garmin','start')},'Garmin login'),' ',el('span',{class:'muted'},'bat\\body.bat --login, in its own window: email, password, the code'))];
   if(t==='Blog')return[el('div',{class:'knob'},el('button',{onclick:()=>door('blog','start')},'Deploy the blog'),' ',el('span',{class:'muted'},'bat\\blog.bat, in its own window (the title is on Main)'))];
   return[]}

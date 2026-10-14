@@ -1,0 +1,11 @@
+# Chatterbox 0.1.6 pins torch 2.6, which lacks RTX 5090 (sm_120) support.
+# Resolve with a matched, newer CUDA build in the isolated environment.
+torch==2.10.0
+torchaudio==2.10.0
+# Upstream pins pre-3.12 numpy; use compatible wheels rather than compiling.
+numpy==1.26.4
+pandas==2.2.3
+scipy==1.15.3
+scikit-learn==1.6.1
+numba==0.61.2
+llvmlite==0.44.0

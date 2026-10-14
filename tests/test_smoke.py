@@ -57,6 +57,9 @@ import memory
 import assemble
 import tools
 import config
+tools.handy._credentials = lambda: ("", "")  # smoke tests never reach a real device
+config.CHAT_SHOW_THINKING = True  # fixtures assert thinking events, regardless of the keeper's UI preference
+config.EARS_USE_VIBE = False  # native-audio cases enable and stub it explicitly below; never call the keeper's live Ollama
 config.TELEGRAM_QUIET_HOURS = (6, 6)  # the suite runs at any hour; quiet hours are tested on their own
 config.CREATION_NOTES = False  # the older creation tests pin exact results; the notes are tested on their own
 config.CHAT_RESCUE_TEMPERATURE = 0  # the older salad tests count posts; the cool roll is tested on its own
@@ -2312,8 +2315,13 @@ check("think: retries=0 accepts a thoughtless answer", len(_posts) == 1 and _m["
 _posts.clear()
 config.CHAT_THINK = False
 _m = _chat_orig([{"role": "user", "content": "hi"}])
-check("think: flag off sends no think and never re-rolls",
-      len(_posts) == 1 and "think" not in _posts[0])
+check("think: flag off explicitly disables thinking and never re-rolls",
+      len(_posts) == 1 and _posts[0].get("think") is False)
+_posts.clear()
+config.CHAT_THINK = True
+_m = _chat_orig([{"role": "user", "content": "hi"}], think=False, think_retries=0)
+check("think: live voice explicitly disables thinking even with chat thinking enabled",
+      len(_posts) == 1 and _posts[0].get("think") is False and not _m.get("rerolled"))
 ollama_client._post = _post_orig
 config.CHAT_THINK, config.CHAT_THINK_RETRIES = True, 1
 
@@ -7078,8 +7086,9 @@ config.TOOL_KIT = "nonsense"; tools.refresh_her_tools()
 _kit_unknown = _kit_names()
 config.TOOL_KIT = _kit0; tools.refresh_her_tools()
 import json as _kjson
-check("kit: full is every built-in; small and tiny are its named subsets, in the file's order; a list is a kit of one's own; an unknown name means full",
-      _kit_full[:len(tools._BUILTIN_DEFINITIONS) - len(tools.STONE_TOOLS)] == [d["function"]["name"] for d in tools._BUILTIN_DEFINITIONS if d["function"]["name"] not in tools.STONE_TOOLS]  # no stone named: its four leave (10-05)
+_kit_absent_hardware = tools.STONE_TOOLS | tools.handy.TOOL_NAMES
+check("kit: full keeps available built-ins; small and tiny are its named subsets, in the file's order; a list is a kit of one's own; an unknown name means full",
+      _kit_full[:len(tools._BUILTIN_DEFINITIONS) - len(_kit_absent_hardware)] == [d["function"]["name"] for d in tools._BUILTIN_DEFINITIONS if d["function"]["name"] not in _kit_absent_hardware]
       and set(_kit_small) - _kit_forged == tools.KITS["small"] and set(_kit_tiny) - _kit_forged == tools.KITS["tiny"]
       and [n for n in _kit_small if n not in _kit_forged] == [n for n in _kit_full if n in tools.KITS["small"]]
       and [n for n in _kit_own if n not in _kit_forged] == ["write_journal", "do_nothing"] and _kit_forged <= set(_kit_own)
@@ -7225,7 +7234,7 @@ for _dd in doors.DOORS:
     doors.pid_file(_dd).unlink(missing_ok=True)
 check("doors: alive — our own pid is, an ended child's isn't, nor 0 or a word; the doors named (the panel one of them since 09-30)",
       doors.alive(_dos.getpid()) and not doors.alive(_d_dead) and not doors.alive(0) and not doors.alive("x") and not doors.alive(None)
-      and doors.DOORS == ("heartbeat", "wake", "bridge", "parlor", "chat", "panel", "blackbox", "touchstone"), _d_dead)
+      and doors.DOORS == ("heartbeat", "wake", "bridge", "parlor", "chat", "panel", "blackbox", "touchstone", "phone"), _d_dead)
 _d_rec = doors.mark("chat", "chat")
 _d_file = config.MEMORY_DIR / ".pids" / "chat.json"
 _d_st = doors.status("chat")
@@ -7676,7 +7685,7 @@ check("panel: state — the version, a light for every door (the panel one of th
       and _pst["update_here"] is True and _pst["folder"] == config.ROOT.name
       and _pst["newer"] and _pst["newer"]["version"] == _nw_next and _pst["newer"]["installed"] == _nw_inst and "release notes" in panel.PAGE and 'id="newer"' in panel.PAGE
       and _pst["version"] == version.read(config.ROOT) and list(_pst["doors"]) == list(doors.DOORS) + ["discord"] and "panel" in _pst["doors"]
-      and all(v == {"running": False} for v in _pst["doors"].values()) and _pst["secrets"] == {"telegram": False, "discord": False, "brave": False} and _pst["bridge"] == ""  # no bridge up: no road
+      and all(v == {"running": False} for v in _pst["doors"].values()) and _pst["secrets"] == {"telegram": False, "discord": False, "brave": False, "handy_connection_key": False, "handy_api_token": False, "handy_application_key": False} and _pst["bridge"] == ""  # no bridge up: no road
       and list(_pst["tabs"]) == [*panel.TABS, "Advanced"] and _pst["heartbeat_minutes"] == 120
       and set(_pst["skills"]) == {"shelf", "quarantine", "cards"} and _pst["links"]["parlor"] == "http://127.0.0.1:8765", sorted(_pst))
 check("panel: the brain — Ollama asked at the config's OLLAMA_URL (the file's, not the imported one), Gemma first, the loaded model's share of the card, "
@@ -8078,7 +8087,9 @@ _p_st_json = _pjson.dumps(panel.state())
 check("panel: the bot token into memory/telegram.json with the pairing's chat_id kept, the Brave key into memory/web_search.json; state says only that they are set",
       _pse["ok"] and _pse2["ok"] and _p_tg == {"token": "123456:NEW-token_zz", "chat_id": 4242}
       and _pjson.loads(_p_secret_files["brave"].read_text(encoding="utf-8")) == {"brave_key": "BRAVE-key-zz"}
-      and '"secrets": {"telegram": true, "discord": false, "brave": true}' in _p_st_json and "NEW-token_zz" not in _p_st_json and "BRAVE-key-zz" not in _p_st_json
+      and _pjson.loads(_p_st_json)["secrets"] == {"telegram": True, "discord": False, "brave": True,
+          "handy_connection_key": False, "handy_api_token": False, "handy_application_key": False}
+      and "NEW-token_zz" not in _p_st_json and "BRAVE-key-zz" not in _p_st_json
       and "NEW-token_zz" not in _pse["note"], (_pse, _p_tg))
 check("panel: a secret never touches config.py (the fixture nor the real one); a token with a space in it, an empty one or an unknown kind refused",
       _p_cfg_hash == (_phash.sha256(panel.CONFIG_FILE.read_bytes()).hexdigest(), _phash.sha256((config.ROOT / "engine" / "config.py").read_bytes()).hexdigest())
@@ -8564,7 +8575,7 @@ def _x_cmd(path: Path):
     """(script, arguments) of a launcher's one command — comments and the pause left out; %* and "$@" are ARGS."""
     text = path.read_text(encoding="utf-8")
     if path.suffix == ".bat":
-        m = _xre.search(r"^\(?py engine\\(\w+)\.py([^&\r\n)]*)", text, _xre.M)
+        m = _xre.search(r"^\(?(?:py|python) engine\\(\w+)\.py([^&\r\n)]*)", text, _xre.M)
         return (m.group(1), m.group(2).strip().replace("%*", "ARGS")) if m else None
     m = _xre.search(r"^\s*\{?\s*python3 engine/(\w+)\.py([^;\n]*)", text, _xre.M)
     return (m.group(1), m.group(2).strip().replace('"$@"', "ARGS")) if m else None
@@ -8588,7 +8599,7 @@ for _xk, _xp in [*_x_cmds.items(), *_x_shs.items()]:
             and (_xt.endswith('read -n1 -r -p "(press any key to close)"\n') or _xk == "update")):
         _x_shape.append(_xk + _xp.suffix)
 check("launchers: every .bat has a .command (a Mac) and a .sh (Linux) twin — the same names, and the same engine script with the same arguments in all three",
-      set(_x_bats) == set(_x_cmds) == set(_x_shs) and len(_x_bats) == 22 and _x_disagree == [], (sorted(set(_x_bats) ^ set(_x_shs)), _x_disagree))
+      set(_x_bats) == set(_x_cmds) == set(_x_shs) and len(_x_bats) == 24 and _x_disagree == [], (sorted(set(_x_bats) ^ set(_x_shs)), _x_disagree))
 check("launchers: each twin is #!/bin/bash, cds where its .bat does (the root for anima, the folder above for bat/), LF line ends, and ends in the pause",
       _x_shape == [], _x_shape)
 check("launchers: the twins are executable (the bit a download can lose — README, chmod +x)",

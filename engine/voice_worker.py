@@ -24,7 +24,9 @@ _stt = None
 _stt_key = None
 _stt_parked = False
 _stt_warmed = False
+_reference = ""
 _warmed = False
+_clone_prompt = None
 
 
 class SpeechCancelled(Exception):
@@ -54,18 +56,20 @@ def release_cuda_cache() -> None:
             print(f"Unused CUDA cache could not be released: {e}", file=sys.stderr)
 
 
-def encode_audio(samples, rate):
+def encode_audio(samples, rate, subtype="PCM_16"):
     import soundfile as sf
     buf = io.BytesIO()
-    sf.write(buf, samples, rate, format="WAV", subtype="PCM_16")
+    if subtype not in ('PCM_16','PCM_24'):raise ValueError('Unsupported speech PCM format.')
+    sf.write(buf, samples, rate, format="WAV", subtype=subtype)
     return {"audio": base64.b64encode(buf.getvalue()).decode("ascii"), "seconds": len(samples) / rate}
 
 
 def check(req) -> dict:
     import importlib.util
-    missing = [name for name in ("moshi", "torch", "faster_whisper", "soundfile")
-               if importlib.util.find_spec(name) is None]
-    return {"installed": not missing, "missing": missing}
+    package = {"qwen": "qwen_tts", "kyutai": "moshi"}.get(req.get("backend"), "chatterbox")
+    missing = [p for p in (package, "faster_whisper", "soundfile", "torch")
+               if importlib.util.find_spec(p) is None]
+    return {"installed": not missing, "missing": missing, "python": sys.version.split()[0]}
 
 
 
@@ -90,9 +94,15 @@ def resume_recognizer() -> None:
         _stt_parked = False
 
 
-def models(req: dict, speech=True):
-    global _tts, _stt, _stt_key, _stt_warmed, _stt_parked
-    name = req.get("stt_model") or "large-v3-turbo"
+def models(req: dict, speech=True, require_voice=True):
+    global _tts, _stt, _stt_key, _stt_warmed, _stt_parked, _reference, _clone_prompt
+    # Offline is set BEFORE importing Hugging Face/transformers.
+    if req.get("offline"):
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    if req.get("backend") == "kyutai":
+        os.environ.setdefault("NO_TORCH_COMPILE", "1")
+    name = req.get("stt_model") or "small.en"
     stt_device = req.get("stt_device") or "cpu"
     if stt_device not in ("cpu", "cuda"):
         raise ValueError("Speech recognition device must be cpu or cuda.")
@@ -110,9 +120,67 @@ def models(req: dict, speech=True):
         park_recognizer(req)
     else:
         resume_recognizer()
+    if speech and req.get("backend") == "kyutai":
+        if _tts is None:
+            from kyutai_voice import KyutaiVoice
+            _tts = KyutaiVoice(req.get("device") or "cuda")
+        return
+    if speech and req.get("backend") == "qwen":
+        if _tts is None:
+            import torch
+            from qwen_tts import Qwen3TTSModel
+            where = req.get("device") or "cuda"
+            if where == "cuda" and not torch.cuda.is_available():
+                raise RuntimeError("CUDA is unavailable in the Qwen voice environment.")
+            _tts = Qwen3TTSModel.from_pretrained("Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                        device_map="cuda:0" if where == "cuda" else where,
+                        dtype=torch.bfloat16 if where == "cuda" else torch.float32, attn_implementation="sdpa")
+        ref = req.get("reference") or ""
+        if not ref:
+            if require_voice:
+                raise RuntimeError("Choose a voice sample or audition for Qwen first.")
+            return
+        if ref != _reference:
+            import librosa
+            audio, rate = librosa.load(ref, sr=16000, mono=True, duration=16)
+            transcript = req.get("reference_text") or ""
+            try:
+                listing = json.loads((Path(ref).parent / "manifest.json").read_text(encoding="utf-8"))
+                item = next(v for v in listing["voices"] if v["reference"] == Path(ref).name)
+                transcript = transcript or item.get("reference_text") or listing.get("reference_text") or ""
+            except (OSError, ValueError, KeyError, StopIteration, TypeError):
+                pass
+            if not transcript:
+                resume_recognizer()
+                segments, _ = _stt.transcribe(audio, language=req.get("language") or "en", beam_size=1)
+                transcript = " ".join(s.text.strip() for s in segments).strip()
+                park_recognizer(req)
+            if not transcript:
+                raise RuntimeError("No words were found in this voice sample.")
+            _clone_prompt = _tts.create_voice_clone_prompt(ref_audio=(audio, rate), ref_text=transcript, x_vector_only_mode=False)
+            _reference = ref
+        return
     if speech and _tts is None:
-        from kyutai_voice import KyutaiVoice
-        _tts = KyutaiVoice(req.get("device") or "cuda", offline=bool(req.get("offline")))
+        import torch
+        from chatterbox.tts_turbo import ChatterboxTurboTTS
+        from huggingface_hub import snapshot_download
+        device = req.get("device") or "cuda"
+        if device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA is unavailable in the voice Python. Run bat/setup-voice.bat, or choose LIVE_VOICE_DEVICE = 'cpu'.")
+        # 0.1.6's from_pretrained unconditionally requests an HF token even
+        # though these weights are public. Download explicitly without a login.
+        local = snapshot_download("ResembleAI/chatterbox-turbo", token=False,
+                                  allow_patterns=["*.safetensors", "*.json", "*.txt", "*.pt", "*.model"],
+                                  local_files_only=bool(req.get("offline")))
+        _tts = ChatterboxTurboTTS.from_local(local, device=device)
+    ref = req.get("reference") or ""
+    if speech and ref and ref != _reference:
+        if not Path(ref).is_file():
+            raise RuntimeError("The selected voice sample does not exist. Choose it again in the parlor.")
+        _tts.prepare_conditionals(ref)
+        _reference = ref
+    if speech and require_voice and getattr(_tts, "conds", None) is None:
+        raise RuntimeError("Choose a clean English voice sample longer than five seconds in the parlor before speaking.")
 
 
 def handle(req: dict, emit=None, cancel=None) -> dict:
@@ -135,6 +203,13 @@ def _handle(req: dict, emit=None, cancel=None) -> dict:
     global _warmed, _stt_warmed
     if req["op"] == "check":
         return check(req)
+    if req["op"] == "reference_info":
+        import librosa
+        samples, rate = librosa.load(req["path"], sr=24000, mono=True, duration=16)
+        seconds = len(samples) / rate
+        if seconds <= 5:
+            raise ValueError("Choose a voice sample longer than five seconds; 6–15 seconds of clean English speech works best.")
+        return {"seconds": seconds}
     if req["op"] == "warmup":
         models(req, speech=False)
         if not _stt_warmed:
@@ -148,6 +223,8 @@ def _handle(req: dict, emit=None, cancel=None) -> dict:
             list(segments)
             _stt_warmed = True
         park_recognizer(req)
+        if req.get("recognition_only"):
+            return {"ready": True}
         models(req)
         if not _warmed:
             # Pay first CUDA/kernel and watermark initialization before
@@ -156,13 +233,27 @@ def _handle(req: dict, emit=None, cancel=None) -> dict:
             _warmed = True
         return {"ready": True}
     if req["op"] == "download":
-        models(req)
-        return {"downloaded": True}
+        models(req, require_voice=False)
+        required = False if req.get("backend") == "kyutai" else _clone_prompt is None if req.get("backend") == "qwen" else getattr(_tts, "conds", None) is None
+        return {"downloaded": True, "reference_required": required}
     if req["op"] == "transcribe":
         import soundfile as sf
         import numpy as np
         raw = base64.b64decode(req["audio"], validate=True)
         samples, rate = sf.read(io.BytesIO(raw), dtype="float32", always_2d=True)
+        if req.get("discord_input"):
+            if rate != 48000 or samples.shape[1] != 2 or not 0 < len(samples) <= 48000 * 31:
+                raise ValueError("Expected stereo 48 kHz call audio, at most 31 seconds.")
+            # Average the channels without boosting gain, then use libswresample
+            # for anti-alias filtering into the usual mono 16 kHz input.
+            import av
+            mono = samples.mean(axis=1, keepdims=True)
+            frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(mono.T), format="fltp", layout="mono")
+            frame.sample_rate = rate
+            resampler = av.AudioResampler(format="fltp", layout="mono", rate=16000)
+            frames = resampler.resample(frame) + resampler.resample(None)
+            samples = np.concatenate([f.to_ndarray().T for f in frames], axis=0)
+            rate = 16000
         if rate != 16000 or len(samples) > 16000 * 31 or samples.shape[1] != 1:
             raise ValueError("Expected mono 16 kHz audio, at most 31 seconds.")
         models(req, speech=False)
@@ -177,7 +268,9 @@ def _handle(req: dict, emit=None, cancel=None) -> dict:
         models(req)
         samples, rate = generate(req, req["text"])
         buf = io.BytesIO()
-        sf.write(buf, samples, rate, format="WAV", subtype="PCM_16")
+        subtype=req.get('pcm_format','PCM_16')
+        if subtype not in ('PCM_16','PCM_24'):raise ValueError('Unsupported speech PCM format.')
+        sf.write(buf, samples, rate, format="WAV", subtype=subtype)
         return {"audio": base64.b64encode(buf.getvalue()).decode("ascii"),
                 "seconds": len(samples) / rate}
     if req["op"] == "synthesize_stream":
@@ -190,15 +283,29 @@ def _handle(req: dict, emit=None, cancel=None) -> dict:
             if cancel is not None and cancel.is_set():
                 raise SpeechCancelled()
             seconds += len(samples) / rate
-            emit(dict(encode_audio(samples, rate), event="audio"))
-        _, _, first = _tts.synthesize(req["text"], req.get("style") or "calm", req.get("kyutai_voice"), on_audio=audio_ready)
+            emit(dict(encode_audio(samples, rate,req.get('pcm_format','PCM_16')), event="audio"))
+        extra={'delivery':req['delivery']} if req.get('delivery') is not None else {}
+        try:
+            _, _, first = _tts.synthesize(req["text"], req.get("style") or "calm", req.get("kyutai_voice"), on_audio=audio_ready,**({'cancel':cancel} if cancel is not None else {}),**extra)
+        except InterruptedError:
+            if cancel is not None and cancel.is_set():raise SpeechCancelled()
+            raise
         return {"seconds": seconds, "first_audio_s": first}
     raise ValueError("Unknown speech operation")
 
 
 def generate(req, text):
-    samples, rate, _ = _tts.synthesize(text, req.get("style") or "calm")
-    return samples, rate
+    if req.get("backend") == "kyutai":
+        extra={'delivery':req['delivery']} if req.get('delivery') is not None else {}
+        samples, rate, _ = _tts.synthesize(text, req.get("style") or "calm", req.get("kyutai_voice"),**extra)
+        return samples, rate
+    if req.get("backend") == "qwen":
+        import re
+        text = re.sub(r"\[(?:laugh|chuckle|sigh|gasp|cough|clear throat|sniff)\]", "", text).strip()
+        wavs, rate = _tts.generate_voice_clone(text=text, language="English", voice_clone_prompt=_clone_prompt, max_new_tokens=1200)
+        return wavs[0], rate
+    wav = _tts.generate(text)
+    return wav.squeeze().detach().cpu().numpy(), _tts.sr
 
 
 def main():

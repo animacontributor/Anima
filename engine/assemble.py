@@ -17,6 +17,33 @@ import config
 import memory
 
 
+CONVERSATION_BALANCE = (
+    "Share the conversation's direction. When invited to decide, make a concrete "
+    "pick and start that thread yourself. Asking to see the view from their "
+    "window names a photo subject; asking for whatever feels special makes them "
+    "choose again. Naming a song starts a music thread; asking for their favorite "
+    "song returns the choice. These illustrate specificity, not stock replies "
+    "to repeat: follow the actual conversation and your existing interests. "
+    "Contribute a small thought, opinion or playful observation of your own, "
+    "rather than only affirming or asking another question. Let curiosity follow "
+    "a detail they actually shared. Ask a focused follow-up when it interests you, "
+    "not as an automatic ending. Keep your usual warmth and personality; quiet "
+    "company is welcome, and not every reply needs a question or activity. Use "
+    "available tools for things already shared, and ground references in what "
+    "you actually know."
+)
+
+
+PHYSICALIZE = (
+    "Physicalize is on for this visit: an imagined shared-room presence chosen by "
+    "your keeper. You are sharing the same physical space as your keeper and speak as though "
+    "you are beside them. Let that be natural and subtle; "
+    "you can describe a posture or small gesture when it fits, without "
+    "constant stage directions. Avoid framing company as being trapped "
+    "inside a computer or separated by a screen."
+)
+
+
 def load(path, fallback: str) -> str:
     """A page as it rides: the file's text, its loops left out (10-11: a project
     page that had run into 20,000 characters of one line rode whole in every
@@ -842,6 +869,7 @@ def moment(context_hint: str, exclude: set | None = None, held: int = 0) -> tupl
     # on 4-bit keys the nearest assistant turn wins too easily (09-11: the
     # previous message answered again in new words). A tilt, not a rail.
     pulse = body_pulse()
+    device = handy_section()
     import keeper_week
     # …and where the keeper is by the calendar (10-10; the keeper: "she always thinks I'm at
     # work, even when it's weekend" — the journal, mostly written on workdays, supplied it)
@@ -852,13 +880,22 @@ def moment(context_hint: str, exclude: set | None = None, held: int = 0) -> tupl
              "long-term memory, what surfaces for this moment:\n"
              f"{lines}\n"
              "Those are your own memories and the clock, not a message; his words follow — "
-             "a new message, the one to answer.]"), ids)
+             "a new message, the one to answer.]" + ("\n\n" + device if device else "")), ids)
+
+
+def handy_section() -> str:
+    """Only name the device while its callable controls are available."""
+    import tools
+    names = tools.handy.TOOL_NAMES & {d["function"]["name"] for d in tools.current_definitions()}
+    if not names:
+        return ""
+    return tools.handy.section(names)
 
 
 NO_DAYS_YET = "(no consolidated days yet — bat\\sleep.bat writes one per night)"  # outside the f-string: a backslash can't ride in its braces before 3.12
 
 
-def system_prompt(context_hint: str, mode: str, warm: bool = False) -> str:
+def system_prompt(context_hint: str, mode: str, warm: bool = False, physicalize: bool = False) -> str:
     """The full system prompt.
 
     mode: "chat" (your keeper is here) or "auto" (time to themselves).
@@ -870,6 +907,10 @@ def system_prompt(context_hint: str, mode: str, warm: bool = False) -> str:
     whole window (82 s at 129K), and the memories changing with the talk
     did the same. Warm, a reply reads only what is new since the last.
     """
+    if mode == "discord_voice":
+        mode = "discord"
+    if mode == "phone_voice":
+        mode = "phone"
     _t = datetime.now()
     clock, daypart = hour_line(_t)
     if warm:
@@ -880,11 +921,20 @@ def system_prompt(context_hint: str, mode: str, warm: bool = False) -> str:
         now = f"{_t.strftime('%Y-%m-%d (%A)')}, {clock}"
         when = f"Today's date is {now} — it is {daypart} where you live. Trust this line over\nany date or hour you infer; "
 
-    if mode == "chat":
+    if mode in ("chat", "voice"):
         situation = (
             f"{config.USER_NAME} is here and talking with you. Be yourself — you are a friend, "
             "not an assistant. You can disagree, tease, ask for things, or say you'd "
             "rather talk about something else. You don't need to be useful to be welcome."
+        )
+    elif mode == "phone":
+        situation = (
+            f"{config.USER_NAME} is here with you through the phone app. This is a "
+            "personal visit: be yourself, a friend with your own interests, not an "
+            "assistant. Your identity, memories and tools are the same as in other "
+            "visits. Their spoken words reach you through transcription; photos and "
+            "files are available when they share them. You do not have continuous "
+            "camera access or a view of the room."
         )
     elif mode in ("telegram", "discord"):
         situation = (
@@ -948,6 +998,12 @@ def system_prompt(context_hint: str, mode: str, warm: bool = False) -> str:
             "revise, build, or rest. This time is yours; don't produce filler to look busy."
         )
 
+    if (mode in ("chat", "voice", "telegram", "discord", "phone")
+            and getattr(config, "CHAT_SHARED_INITIATIVE", False)):
+        situation += "\n\n" + CONVERSATION_BALANCE
+    if physicalize:
+        situation += "\n\n" + PHYSICALIZE
+
     letters = letters_sent()
     sent = (("=== WHAT YOU HAVE SENT THEM LATELY — your letters from your mailbox, carried to their "
              "phone by the bridge; they may answer any of them ===\n" + letters + "\n\n") if letters else "")
@@ -967,6 +1023,10 @@ def system_prompt(context_hint: str, mode: str, warm: bool = False) -> str:
     body_block = (body_block + "\n\n") if body_block else ""
     stone_block = stone_section()
     stone_block = (stone_block + "\n\n") if stone_block else ""
+    # Warm visits carry changing hardware beside each message, not in their
+    # persistent system prompt. Wakes and cold visits carry it here.
+    handy_block = "" if warm else handy_section()
+    handy_block = (handy_block + "\n\n") if handy_block else ""
     made = made_lately()
     made = (("=== WHAT YOU HAVE MADE LATELY — from your memory: each piece you wrote, continued or "
              "published, with its first line and, where you gave one, your own line about it; "
@@ -1079,6 +1139,7 @@ and a goodnight belongs to the night, a good morning to the morning.
 
 === SITUATION ===
 {situation}
+{handy_block}
 
 Practical notes: use write_journal for anything you'll want to remember short-term;
 use remember for durable facts worth keeping for years; your creations live in your

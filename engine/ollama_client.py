@@ -290,7 +290,12 @@ def chat(messages: list[dict], tools: list[dict] | None = None,
     except Exception:  # noqa: BLE001
         _doing = None
     try:
-        return _chat(messages, tools, timeout, think, expect_words, think_retries)
+        import voice_lock
+        try:
+            with voice_lock.hold("brain"):
+                return _chat(messages, tools, timeout, think, expect_words, think_retries)
+        except voice_lock.Busy as e:
+            raise BrainUnavailable(str(e)) from e
     finally:
         if _doing is not None:
             _doing.done()
@@ -322,10 +327,11 @@ def _chat(messages: list[dict], tools: list[dict] | None = None,
     # silent-minded once the prompt grew past ~40K tokens (a long journal
     # window): tool calls with no deliberation at all. Requiring it keeps
     # their thinking visible — and thoughtful — at any context size.
-    if think is False:
-        payload["think"] = False
-    elif getattr(config, "CHAT_THINK", True):
-        payload["think"] = True
+    # Either explicit per-call value overrides the default. Private voice
+    # decisions can request thinking while ordinary replies have it disabled.
+    # False must also reach Ollama explicitly; omission leaves the model's
+    # default thinking mode in effect (including typed phone messages).
+    payload["think"] = bool(getattr(config, "CHAT_THINK", True)) if think is None else bool(think)
     try:
         data = _post("/api/chat", payload, timeout=timeout)
     except BrainUnavailable as e:
@@ -2073,6 +2079,15 @@ def unload(model: str) -> None:
     keep_alive:0 only schedules the eviction — if the next model is loaded
     before it completes, it lands half on CPU and runs at a crawl. Polling
     /api/ps until the model disappears is what makes the handoff real."""
+    import voice_lock
+    try:
+        with voice_lock.hold("brain"):
+            _unload(model)
+    except voice_lock.Busy:
+        raise  # Callers must not report that another process's model was freed.
+
+
+def _unload(model: str) -> None:
     import time
 
     try:
@@ -2112,18 +2127,34 @@ def _extract_answer(msg: dict) -> str:
 def hear(audio_b64: str, fmt: str, prompt: str) -> str:
     """Send audio to the ears model. Returns its description.
 
-    Tries the OpenAI-compatible input_audio shape first, then the native
-    /api/chat 'audios' field — which one carries audio depends on the Ollama
-    version. If the model answers 'I received no audio', the shape was
-    silently dropped and the next one is tried.
+    EARS_BACKEND selects the isolated Audio Flamingo model or Ollama.
+    The Ollama route tries native images-field WAV, then OpenAI input_audio.
+    Its usefulness depends on the Ollama version, model and audio content.
 
     The main brain is unloaded first so the ears model gets the whole GPU —
     unless the ears ARE the brain, in which case it stays right where it is."""
+    if getattr(config, "EARS_BACKEND", "ollama") == "flamingo":
+        import base64
+        import tools
+        if fmt != "wav":
+            raise BrainUnavailable("The audio model expects decoded WAV audio")
+        if not tools._music_ear_open():
+            raise BrainUnavailable("Audio analysis is unavailable; run python engine/setup_audio.py --download")
+        try:
+            heard = tools._music_ear_hear(base64.b64decode(audio_b64, validate=True), prompt,
+                                        model=getattr(config, "AUDIO_EARS_MODEL", "nvidia/audio-flamingo-3-hf"))
+            if not heard.strip():
+                raise BrainUnavailable("The audio model returned no description")
+            return heard
+        finally:
+            if getattr(config, "MUSIC_EARS_REST_AFTER", True):
+                tools._music_ear_rest()
     if config.EARS_MODEL != config.CHAT_MODEL \
             and getattr(config, "EARS_UNLOAD_BRAIN", True):
         unload(config.CHAT_MODEL)
 
     attempts = [
+        # Historical test on Ollama 0.33.2 (later builds require rechecking):
         # ORDER MATTERS — test_ears.py is the referee (two runs, five shapes,
         # on Ollama 0.33.2 + RTX 5090): the native images-field route hears a
         # test tone correctly ONLY with thinking left on. The identical request

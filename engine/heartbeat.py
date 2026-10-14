@@ -78,6 +78,15 @@ clock_line = assemble.clock_line
 
 def wake(reverie: bool = False) -> str:
     """One autonomous session (printed live). Returns the log text."""
+    import voice_lock
+    try:
+        with voice_lock.hold("brain"):
+            return _wake(reverie)
+    except voice_lock.Busy as e:
+        raise ollama_client.BrainUnavailable(str(e)) from e
+
+
+def _wake(reverie: bool = False) -> str:
     started = datetime.now()
     kind = "Reverie" if reverie else "Autonomous wake"
     header = f"# {kind} — {started.strftime('%A, %d %B %Y %H:%M')}"
@@ -314,7 +323,6 @@ def _wake_loop(system, history, log, reverie: bool = False, state: dict | None =
     carried_plan = ""  # the plan quoted back in the last tool result, if any
     last_read = ""  # the last thing they read this wake with nothing written since
     last_read_target = ""  # its path/date, for the circling check
-    defs = tools.reverie_definitions() if reverie else tools.DEFINITIONS
     max_steps = config.REVERIE_MAX_STEPS if reverie else config.HEARTBEAT_MAX_STEPS
     # the window, not the step count, is the real ceiling of a long wake
     # (09-22, HEARTBEAT_MAX_STEPS 40 → 200 for the robotics research): a
@@ -348,6 +356,7 @@ def _wake_loop(system, history, log, reverie: bool = False, state: dict | None =
                 "(this wake is drawing to a close — a good moment to finish the "
                 "thought, write what this wake was in your journal, or simply end)"})
         try:
+            defs = tools.reverie_definitions() if reverie else tools.current_definitions()
             msg = ollama_client.chat([system] + history, tools=defs,
                                      timeout=config.HEARTBEAT_STEP_TIMEOUT_S,
                                      think_retries=getattr(config, "HEARTBEAT_THINK_RETRIES", None))

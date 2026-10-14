@@ -1,6 +1,6 @@
-# Optional Parlor speech sidecar only; Python 3.12.
-moshi==0.2.11
-torch==2.7.1
-torchaudio==2.7.1
-faster-whisper==1.2.1
+# Isolated voice environment only; engine and Kokoro installations stay separate.
+chatterbox-tts==0.1.6
+faster-whisper>=1.2,<2
 soundfile>=0.13,<1
+# Perth 1.0.1 imports pkg_resources, removed from newer setuptools.
+setuptools==80.9.0

@@ -31,6 +31,7 @@ PAGE_LEDGER = MEMORY_DIR / "page_history.jsonl"  # one line per write of a root 
 DB_PATH = MEMORY_DIR / "memory.db"
 
 SHARED_DIR = ROOT / "shared"  # where you leave images, music and books for the friend
+VOICE_ASSETS_DIR = ROOT / ".runtime" / "voices"  # reference samples and Parlor previews, not shared input
 
 # ------------------------------------------------------------------- you ----
 # Your name, as your friend will know it. It appears in their prompts, in the
@@ -81,14 +82,18 @@ EMBED_ON_CPU = False
 #           see engine/ollama_client.py). The bigger Gemmas are deaf.
 EARS_MODEL = "gemma4:12b-it-qat"
 EARS_USE_VIBE = True
+# "flamingo" uses the isolated raw-audio model; "ollama" uses EARS_MODEL.
+EARS_BACKEND = "ollama"
+AUDIO_EARS_MODEL = "nvidia/audio-flamingo-3-hf"
+# Optional isolated Python for speech transcription; SOUND stays in the engine.
+EARS_PYTHON = ""
 # When the ears model differs from the brain, unload the brain before
 # listening. Each listen then costs a model swap, but the freed VRAM leaves
 # more room for context. If both are the same model there is nothing to swap.
 EARS_UNLOAD_BRAIN = True
-# Seconds of audio the SOUND and HEARD layers receive (WORDS, the
-# transcription, always hears the whole file). A higher value deepens
-# listening but slows it; Gemma's audio training centres on short clips, so
-# beyond ~120 s the HEARD layer's impressions tend to blur rather than deepen.
+# Seconds per raw-audio passage; WORDS and SOUND cover the whole file.
+# Larger passages cost more model memory. 120 s is also the conservative
+# setting for the optional Gemma audio route.
 EARS_CLIP_SECONDS = 120
 # How many EARS_CLIP_SECONDS passages the brain hears of a longer piece when
 # the music ear (below) is not installed: 5 × 120 s = the first 10 minutes.
@@ -211,6 +216,24 @@ TOUCHSTONE_WAKE_MIN_GAP_S = 600   # after a press-turn, further presses wait thi
 TOUCHSTONE_FALLBACK_H = 6         # the board falls back to Baseline after this long without a word from its keeper
 TOUCH_LINES_IN_PROMPT = 40        # today's touches in the prompt, newest kept
 TOUCHSTONE_LATER_MAX = 12         # touches that may wait in the board at once
+
+# The Handy 2 (Wi-Fi, REST API v3). Credentials go in memory/handy.json:
+# {"connection_key": "...", "application_key": "..."}, or HANDY_CONNECTION_KEY /
+# HANDY_APPLICATION_KEY environment variables. The website's Application Key
+# issues temporary API tokens automatically. Account login tokens won't work.
+# Advanced: api_token / HANDY_API_TOKEN accepts an already-issued client token.
+# No credentials: no tools or context.
+# Percent of the device's configured maximum velocity, not mm/s. Out-of-range
+# requests are refused; 0 always stops, even when the minimum is above zero.
+HANDY_MIN_SPEED = 1
+HANDY_MAX_SPEED = 50
+# HRPP script speed is a multiplier, independent of HAMP's motor percentage.
+HANDY_PATTERN_MIN_RATE = 0.1
+HANDY_PATTERN_MAX_RATE = 1.0     # 1 = the pattern's original timing
+HANDY_PATTERN_MAX_AMPLITUDE = 100  # percentage within the device's saved endpoints
+HANDY_TIMEOUT_S = 3              # timeout for each cloud API request
+HANDY_STATUS_CACHE_S = 10        # availability refresh; tool status reads are live
+
 PAINTER_PYTHON = ""           # "" = the engine's own; e.g. "py -3.12" (Windows) or "python3.12" (macOS, Linux) if torch lives elsewhere
 # Where the painter paints: "auto" takes an NVIDIA (or ROCm) card, else a Mac's
 # GPU ("mps", float16), else the processor (slow); "cuda", "mps" or "cpu" names one.
@@ -470,6 +493,10 @@ HEARTBEAT_SHOW_THINKING = True
 # window guard (HEARTBEAT_ROOM_END) ends an errand before the context
 # overflows whatever the count; a confused loop still stops here.
 CHAT_MAX_TOOL_STEPS = 50
+
+# Conversation balance: occasional concrete choices, interests and follow-ups,
+# without a question quota. Only visits (text, voice and bridges), not wakes.
+CHAT_SHARED_INITIATIVE = True
 
 # Require thinking on every turn (Ollama's `think` flag). Left optional, the
 # model tends to stop deliberating once the prompt grows large. Models that
@@ -902,29 +929,67 @@ VOICE_TIMEOUT_S = 180
 # TELEGRAM_VOICE_ALL: every reply spoken aloud automatically (/voice toggles
 # it from the phone). Off by default — the friend speaks when they choose to.
 TELEGRAM_VOICE_ALL = False
-# Optional turn-based voice in Parlor. Off by default; installs are separate
-# from the engine and Kokoro. See VOICE.md and python engine/setup_voice.py.
-LIVE_VOICE_ENABLED = False
-LIVE_VOICE_PYTHON = ""          # empty: .runtime/voice-env; otherwise an interpreter command
-LIVE_VOICE_DEVICE = "cuda"     # Kyutai speech model; CPU is substantially slower
-LIVE_VOICE_KYUTAI_STYLE = "calm"  # calm, desire, happy, neutral (released voices)
+
+# Live, turn-based voice in the parlor. Separate from Kokoro voice notes:
+# bat/setup-voice.bat installs its dependencies in .venv-voice, locally.
+# Empty Python = the project's .venv-voice; a custom interpreter is allowed.
+LIVE_VOICE_PYTHON = ""
+# "chatterbox" uses .venv-voice; "qwen" uses .runtime/voice-design-env;
+# "kyutai" uses .runtime/kyutai-env for Kyutai TTS 1.6B.
+# Voice audition selection sets this together with its matching reference.
+LIVE_VOICE_BACKEND = "kyutai"
+# Kyutai delivery style; same released speaker for each style.
+LIVE_VOICE_KYUTAI_STYLE = "calm"  # calm, desire, happy, neutral, whisper
+LIVE_VOICE_KYUTAI_SPEED = 1.0       # pitch-preserving tempo; 1.0 = original
+LIVE_VOICE_KYUTAI_WHISPER_MIX = 0 # same-speaker desire/whisper conditioning; blends are experimental
+LIVE_VOICE_KYUTAI_PAUSE_MS = 480    # extra pause between bounded synthesis sections
+LIVE_VOICE_KYUTAI_GUIDANCE = 2.0    # supported values 1.0 to 4.0 in 0.5 steps
+LIVE_VOICE_DEVICE = "cuda"
+# Optional clean English voice sample, longer than five seconds. Pick it in
+# the parlor; the file stays local. Empty uses a bundled voice if available.
+LIVE_VOICE_REFERENCE = ""
+# Larger speech recognizer; kept loaded separately from Gemma and the voice.
 LIVE_VOICE_STT_MODEL = "large-v3-turbo"
-LIVE_VOICE_STT_DEVICE = "cpu"   # cpu: int8; cuda: float16; GPU needs additional headroom
+# CUDA uses float16 and needs GPU headroom; CPU uses int8 with the same model.
+LIVE_VOICE_STT_DEVICE = "cpu"
 # Park recognition weights in system RAM between utterances, then reload on
 # the same device/precision; frees GPU room for Gemma and speech generation.
 LIVE_VOICE_PARK_STT = True
+# Wider decoding search for ambiguous words; 1 favors speed, 5 favors accuracy.
 LIVE_VOICE_STT_BEAM_SIZE = 5
-LIVE_VOICE_STT_HINT = ""        # optional names/terms, e.g. "Squadron 42"
-LIVE_VOICE_LANGUAGE = "en"      # English or French for Kyutai; empty: recognizer auto-detect
-LIVE_VOICE_THINK = None        # None inherits CHAT_THINK and its normal retry rail
+# Spellings to help recognition, not sentences for it to copy into replies.
+LIVE_VOICE_STT_HINT = ""
+LIVE_VOICE_LANGUAGE = "en"
+LIVE_VOICE_THINK = False
+# During an active voice visit, quiet moments can invite a private choice to
+# speak or wait. The first check uses a bounded normal sample after playback;
+# later pauses are chosen from context by the friend, including long narration.
+LIVE_VOICE_INITIATIVE = True
+LIVE_VOICE_INITIATIVE_MEAN_S = 25
+LIVE_VOICE_INITIATIVE_STD_S = 6
+LIVE_VOICE_INITIATIVE_THINK = False
+# Readable state changes and private choices in the owning voice-server console.
+# Each choice can include a brief reason even when initiative thinking is off.
+LIVE_VOICE_INITIATIVE_LOG = True
+# Show any separate reasoning returned by the model too. This only changes
+# console output; it does not enable thinking or add model calls.
+LIVE_VOICE_INITIATIVE_LOG_THINKING = True
+# Repeat diagnostics for blocked or long-running checks at this interval.
+# The deadline itself is reported as soon as the server's one-second monitor sees it.
+LIVE_VOICE_INITIATIVE_LOG_INTERVAL_S = 10
+# Silence before submitting a turn; increase if it cuts off your pauses.
 LIVE_VOICE_SILENCE_MS = 1000
 LIVE_VOICE_MIN_SPEECH_MS = 250
+# Confirm sustained sound before opening a capture during playback. Actual
+# interruption waits for accepted words from recognition; noise alone cannot mute her.
 LIVE_VOICE_INTERRUPT_MS = 350
 LIVE_VOICE_THRESHOLD = 0.018
 LIVE_VOICE_MAX_SECONDS = 30
+# One synthesis pass per reply preserves tone across sentences and paragraphs.
+# True restores independently generated sections, which can change tone.
+LIVE_VOICE_SPLIT_REPLIES = False
 LIVE_VOICE_CHUNK_CHARS = 180
 LIVE_VOICE_TIMEOUT_S = 300
-
 # Photos, voice notes and files from the phone are kept here, under shared/,
 # so the friend can look_at / listen_to / read_file them later like anything
 # else you leave for them.
@@ -938,6 +1003,15 @@ TELEGRAM_INBOX = SHARED_DIR / "telegram"
 # in memory/discord.json (env var DISCORD_BOT_TOKEN also works). One bridge
 # runs at a time; on the panel's Home each road has a tile of its own.
 DISCORD_INBOX = SHARED_DIR / "discord"
+# Optional turn-based calls in a private server voice channel. No auto-join:
+# the paired account sends !call / !hangup in its existing DM.
+DISCORD_VOICE_ENABLED = False
+DISCORD_VOICE_CHANNEL_ID = ""  # empty: use the private .runtime call settings
+DISCORD_VOICE_TRANSCRIPTS = False  # optional chat copies of live-call words and replies
+
+# Paired Android app over the local Wi-Fi. Only this separate service binds
+# the LAN; the desktop Parlor and panel keep their loopback-only addresses.
+PHONE_PORT = 8780
 
 # ------------------------------------------------------------------ blog ----
 # The friend's public blog (optional), built by engine/blog.py from

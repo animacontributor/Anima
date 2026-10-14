@@ -35,11 +35,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config
 
-DOORS = ("heartbeat", "wake", "bridge", "parlor", "chat", "panel", "blackbox", "touchstone")  # "wake" is a one-off wake (bat\wake.bat) — it runs beside a loop, as it always did
-ONE_AT_A_TIME = ("heartbeat", "bridge", "parlor", "panel", "blackbox", "touchstone")
+DOORS = ("heartbeat", "wake", "bridge", "parlor", "chat", "panel", "blackbox", "touchstone", "phone")  # "wake" is a one-off wake, beside a loop
+ONE_AT_A_TIME = ("heartbeat", "bridge", "parlor", "panel", "blackbox", "touchstone", "phone")
 
 # why a second one is refused, said in the refusal
 _WHY = {
+    "phone": "one phone server is enough; paired devices share it",
     "heartbeat": "two heartbeats would wake them twice over and share the card",
     "bridge": "two bridges would answer every message twice",
     "parlor": "two parlors can't share the port",
@@ -49,6 +50,7 @@ _WHY = {
 }
 # what to do instead, said in the refusal
 _INSTEAD = {
+    "phone": "open its local setup page, or use the panel's Stop",
     "heartbeat": "to stop that one: Ctrl+C in its window, or a file named .stop-heartbeat in memory/ "
                  "(it leaves after the wake it is in)",
     "bridge": "to stop that one: Ctrl+C in its window, or a file named .stop-bridge in memory/ "

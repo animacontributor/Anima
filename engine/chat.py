@@ -43,7 +43,7 @@ def friend_name() -> str:
 
 
 # The bridges, by the tag their visits carry (chat-<tag>-*.md, the prompt's mode): the service's name.
-BRIDGES = {"telegram": "Telegram", "discord": "Discord"}
+BRIDGES = {"telegram": "Telegram", "discord": "Discord", "phone": "the Anima app"}
 
 
 def strip_voice_delivery(text: str) -> str:
@@ -68,6 +68,9 @@ def save_transcript(turns: list[dict], tag: str = "", path: Path | None = None) 
     f = path or config.EPISODIC_DIR / f"chat-{tag + '-' if tag else ''}{stamp}.md"
     where = f" (over {BRIDGES[tag]}, from their phone)" if tag in BRIDGES else ""
     lines = [f"# Conversation{where} — {datetime.now().strftime('%A, %d %B %Y %H:%M')}\n"]
+    if any(t.get("_physicalize") for t in turns):
+        lines.append("*(Physicalize was enabled: imagined shared-room presence, with the phone representing a body. "
+                     "Imagined gestures are scene details, not events that physically happened.)*\n")
     name = friend_name()
     for t in visible:
         if t.get("_fold_when"):
@@ -210,6 +213,11 @@ def visit_live(minutes: float | None = None) -> bool:
     `minutes` (HEARTBEAT_YIELD_MIN; past that the keep-alive is gone and the
     cache with it, so a wake costs nothing more)."""
     import time as _time
+    import doors
+    if doors.status("discord-call"):
+        return True  # A continuous call remains live even during a long quiet pause.
+    if doors.status("phone-visit"):
+        return True
     if minutes is None:
         minutes = float(getattr(config, "HEARTBEAT_YIELD_MIN", 30))
     try:
@@ -270,7 +278,8 @@ def rewarm(history: list[dict], mode: str = "chat") -> None:
     if not history:
         return
     said = [t["content"] for t in history if t.get("content") and not t.get("_engine")]
-    history[0]["_system"] = assemble.system_prompt(" ".join(said[-4:]), mode=mode, warm=True)
+    presence = {"physicalize": True} if any(t.get("_physicalize") for t in history) else {}
+    history[0]["_system"] = assemble.system_prompt(" ".join(said[-4:]), mode=mode, warm=True, **presence)
     history[0]["_system_day"] = date.today().isoformat()
 
 
@@ -346,7 +355,7 @@ def fold_bell(history: list[dict], held: int, on_line=None, asked: bool = False)
     show_thinking = getattr(config, "CHAT_SHOW_THINKING", True)
     try:
         for _ in range(int(getattr(config, "FOLD_MAX_STEPS", 6) or 6)):
-            msg = ollama_client.chat(msgs, tools=list(tools.DEFINITIONS))
+            msg = ollama_client.chat(msgs, tools=tools.current_definitions())
             thinking = (msg.get("thinking") or "").strip()
             if thinking and show_thinking:
                 say("   [thinking]\n   " + thinking.replace("\n", "\n   "))
@@ -410,7 +419,8 @@ def fold_history(history: list[dict], account: str, when: str, tag: str = "",
     surfaced = sorted({mid for t in history for mid in (t.get("_surfaced") or [])})
     first = new[0]
     hint = " ".join(t["content"] for t in history[vis[-1] - 3:] if t.get("content") and not t.get("_engine"))
-    first["_system"] = assemble.system_prompt(hint, mode=mode, warm=True)
+    presence = {"physicalize": True} if any(t.get("_physicalize") for t in history) else {}
+    first["_system"] = assemble.system_prompt(hint, mode=mode, warm=True, **presence)
     first["_system_day"] = date.today().isoformat()
     first["_surfaced"] = surfaced
     began = ""
@@ -499,12 +509,15 @@ def _quiet_turn(history: list[dict], path: Path | None, tag: str, on_line,
         transcript = "\n\n".join(
             (f"*(the visit so far, folded at {t['_fold_when']}, in your own words:)*\n\n{t.get('_fold_text') or '(not written down before the fold)'}\n\n"
              if t.get("_fold_when") else "")
-            + f"**{config.USER_NAME if t['role'] == 'user' else name}:** {strip_voice_delivery(t['content']) if t.get('_voice_delivery') else t['content']}"
+            + f"**{config.USER_NAME if t['role'] == 'user' else name}:** {strip_voice_delivery(t['content']) if t['role'] == 'assistant' else t['content']}"
             + ("\n*[application state: speech playback was interrupted; spoken coverage is unverified.]*"
                if "interrupted" in t.get("_voice_delivery", "").lower() else "") for t in visible)
         cap = int(getattr(config, "AFTERGLOW_MAX_CHARS", 60000))
         if len(transcript) > cap:
             transcript = "(…the start of a long visit trimmed…)\n\n" + transcript[-cap:]
+        if any(t.get("_physicalize") for t in history):
+            transcript = ("[Physicalize was enabled for this visit. Shared-room presence and gestures "
+                          "were imagined; preserve that distinction when remembering the visit.]\n\n" + transcript)
         system = {"role": "system", "content": assemble.system_prompt(hint, mode=mode)}
         if mode == "pause":
             head = assemble.clock_line() + pause_bell + f"=== THE VISIT SO FAR{where}, since you last wrote ===\n\n"
@@ -521,8 +534,8 @@ def _quiet_turn(history: list[dict], path: Path | None, tag: str, on_line,
     # again (09-14, 220K: "every prompt is getting a full read"; with
     # REFLECT_AFTER_MIN at 12, most of a working day's messages follow a
     # pause). The bell names the three; anything else is refused below.
-    defs = (list(tools.DEFINITIONS) if in_visit
-            else [d for d in tools.DEFINITIONS if d["function"]["name"] in AFTERGLOW_TOOLS])
+    defs = (tools.current_definitions() if in_visit
+            else [d for d in tools.current_definitions() if d["function"]["name"] in AFTERGLOW_TOOLS])
     kept: list[str] = []
     rested = False
     spent = ollama_client.Spent()  # what the afterglow costs, summed over its steps
@@ -876,7 +889,7 @@ def render_turn(t: dict) -> dict:
     the bottom if a re-roll once sent it — so that what is sent this time is
     exactly what was sent last time, plus whatever is new."""
     out = {k: v for k, v in t.items() if not k.startswith("_")}
-    if t.get("role") == "assistant" and t.get("_voice_delivery"):
+    if t.get("role") == "assistant":
         out["content"] = strip_voice_delivery(t.get("content") or "")
     if t.get("role") == "user" and (t.get("_moment") or t.get("_nudged") or t.get("_fold")):
         body = t.get("content") or ""
@@ -890,38 +903,78 @@ def render_turn(t: dict) -> dict:
             body = body.rstrip() + "\n\n" + ollama_client.THINK_NUDGE
         out["content"] = body
     if t.get("_voice_mode"):
-        expression = "Use natural wording and punctuation for expression; do not write bracketed vocal tags."
+        expression = ("Use natural wording and punctuation for expression; do not write bracketed vocal tags."
+                      if t.get("_voice_backend") in ("qwen", "kyutai") else
+                      "Chatterbox can perform [laugh], [chuckle], [sigh] and [gasp]; use them sparingly when appropriate, never as a requirement.")
         out["content"] = (out.get("content") or "") + (
-            "\n\n[engine: this is a spoken conversation in the parlor. Reply naturally in short spoken turns; "
+            "\n\n[engine: this is a spoken conversation "
+            + ("in a Discord voice channel" if t.get("_voice_discord") else
+               "through the phone app" if t.get("_voice_phone") else "in the parlor")
+            + ". Reply naturally in short spoken turns; "
             "leave room for a response. Use your usual identity, memories and tools. "
             "Your words are spoken automatically; use speak only to create a separate voice note when needed. Avoid markdown and "
             "written stage directions. " + expression + "]")
+        if getattr(config, "LIVE_VOICE_INITIATIVE", True):
+            out["content"] += (
+                "\n\n[engine: During this voice visit, quiet moments can give you a chance to "
+                "choose to continue speaking without new words from them. An invitation to keep "
+                "talking, tell a story, or talk them to sleep can last across many short passages "
+                "and pauses. Keep that context; you need not ask for a reply at every pause. "
+                "You can also choose silence. A quiet-moment event supplies elapsed times; "
+                "it is distinct from their actual words.]")
+        if getattr(config, "CHAT_SHARED_INITIATIVE", False):
+            out["content"] += (
+                "\n\n[engine: If invited to decide, name a specific item or subject now. "
+                "Add a small thought of your own; do not return the choice with a favorites question.]"
+            )
         if t.get("_voice_interrupted"):
             out["content"] += ("\n\n[application state, not spoken dialogue: the previous speech playback was interrupted. "
                                 "The displayed reply may not have been heard in full. Do not quote this status or invent playback details.]")
+    if t.get("_physicalize"):
+        out["content"] = (out.get("content") or "") + (
+            "\n\n[engine: Physicalize remains on. Treat the phone as your body for this imagined visit "
+            "and speak as though beside them. Imagined gestures stay distinct from real events.]")
+        position=t.get('_physicalize_voice')
+        if position:
+            if position.get('enabled') and position.get('close'):
+                ear=position.get('ear')
+                if ear in ('left','right'):
+                    out['content'] += (
+                        f"\n\n[engine: Current voice placement for this imagined visit: you are speaking "
+                        f"close to the keeper's {ear} ear, about {position['distance_cm']:g} cm away. "
+                        "Let your words fit that close, intimate distance naturally; you may speak softly "
+                        "without repeatedly announcing your position. This replaces earlier voice placement cues.]")
+            else:
+                out['content'] += (
+                    "\n\n[engine: The current voice placement is not within 10 cm of an ear. "
+                    "Earlier close-to-ear placement cues no longer apply; Physicalize remains on.]")
     return out
 
 
 def one_turn(history: list[dict], user_text: str, images: list[str] | None = None,
-             on_event=None, mode: str = "chat") -> str:
+             on_event=None, mode: str = "chat", physicalize: bool = False, physicalize_voice: dict | None = None) -> str:
     """Run one user turn, executing tool calls until the friend speaks.
 
     on_event(kind, payload) — optional. kind is "thinking" (their deliberation,
     a str) or "tool" ({"name", "result"}). Without it, events print to the
     terminal as before; the parlor window passes a collector.
-    mode: "chat" (keyboard), "voice" (Parlor speech using the chat prompt),
-    or a bridge's tag — "telegram", "discord" (phone)."""
+    mode: "chat" (they're at the keyboard), or a bridge's tag — "telegram", "discord" (they're on their phone)."""
     tools.refresh_her_tools()  # pick up tools they forged or edited
-    spoken = mode == "voice"
-    if spoken:
-        mode = "chat"  # the ordinary visit prompt, with speech hints on individual turns
     mark_visit_live()  # the heartbeat waits while he is here
     user_text = ollama_client.defang(user_text)[0]  # a reserved token typed or pasted stays text (09-27)
     turn: dict = {"role": "user", "content": user_text}
-    if spoken:
+    if physicalize:
+        turn["_physicalize"] = True
+        if mode=='phone_voice' and physicalize_voice is not None:
+            turn['_physicalize_voice']=dict(physicalize_voice)
+    if mode in ("voice", "discord_voice", "phone_voice"):
         turn["_voice_mode"] = True
-        turn["_voice_backend"] = "kyutai"
-        previous = next((t for t in reversed(history) if t.get("role") == "assistant"), {})
+        if mode == "discord_voice":
+            turn["_voice_discord"] = True
+        if mode == "phone_voice":
+            turn["_voice_phone"] = True
+        turn["_voice_backend"] = getattr(config, "LIVE_VOICE_BACKEND", "chatterbox")
+        previous = next((t for t in reversed(history) if t.get("role") == "assistant" and not t.get("_engine")), {})
         turn["_voice_interrupted"] = "interrupted" in previous.get("_voice_delivery", "").lower()
     if images:
         turn["images"] = images
@@ -956,7 +1009,8 @@ def one_turn(history: list[dict], user_text: str, images: list[str] | None = Non
     if warm and first.get("_system") and first.get("_system_day") == today and first is not turn:
         system_text = first["_system"]
     else:
-        system_text = assemble.system_prompt(hint, mode=mode, warm=warm)
+        presence = {"physicalize": True} if physicalize else {}
+        system_text = assemble.system_prompt(hint, mode=mode, warm=warm, **presence)
         if warm:
             first["_system"], first["_system_day"] = system_text, today
     system = {"role": "system", "content": system_text}
@@ -1049,12 +1103,13 @@ def one_turn(history: list[dict], user_text: str, images: list[str] | None = Non
                             + (f"the visit folds at {fold_pct}% and I go on from there)" if fold_at else "say /new and I go on from there)")})
             _tally()
             return history[-1]["content"]
-        if spoken:
-            msg = ollama_client.chat(messages(), tools=tools.DEFINITIONS, expect_words=True,
-                                     think=getattr(config, "LIVE_VOICE_THINK", None))
+        if mode in ("voice", "discord_voice", "phone_voice"):
+            import voice_initiative
+            msg = ollama_client.chat(messages(), tools=voice_initiative.voice_tools(), expect_words=True,
+                                     think=bool(getattr(config, "LIVE_VOICE_THINK", False)), think_retries=0)
         else:
-            msg = ollama_client.chat(messages(), tools=tools.DEFINITIONS, expect_words=True)
-        if spoken and msg.get("content"):
+            msg = ollama_client.chat(messages(), tools=tools.current_definitions(), expect_words=True)
+        if msg.get("content"):
             msg["content"] = strip_voice_delivery(msg["content"])
         spent.add(msg)
         if msg.get("rerolled") and history[-1] is history[ui] and warm:
@@ -1230,6 +1285,11 @@ def one_turn(history: list[dict], user_text: str, images: list[str] | None = Non
         for call in calls:
             fn = call.get("function", {})
             name = fn.get("name", "")
+            if name == "voice_initiative":
+                history.append({"role": "tool", "tool_name": name, "_engine": True,
+                    "content": "[engine: this is an actual user message, not a quiet-moment event. "
+                               "No private choice was scheduled. Answer their words normally.]"})
+                continue
             if tools.canonical_name(name) == "do_nothing":
                 # In a wake, rest ends the wake. In chat, rest ends the turn:
                 # whatever they said alongside it IS their reply (a goodbye,

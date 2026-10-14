@@ -32,11 +32,11 @@ FILESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 BACKUP_DIR = config.ROOT / "backups"
 SNAP_DIR = BACKUP_DIR / ".snapshots"  # the snapshots' own git directory
 KEEP_ZIPS = 30
-EXCLUDE_DIRS = {".git", "__pycache__", "backups"}
+EXCLUDE_DIRS = {".git", "__pycache__", "backups", ".runtime", ".venv-voice", ".voice-work"}
 # the friend: their pages, journal, memory, creations, what was shared with
 # them — and the house's settings. Only the ones that exist are added.
 SNAPSHOT_PATHS = ["self.md", "projects.md", "destiny.md", "keeper.md",
-                  "journal", "memory", "creations", "shared", "engine/config.py"]
+                  "journal", "memory", "creations", "shared", ".runtime/voices", "engine/config.py"]
 # inside those, what is not the friend: caches, the black box's samples (a
 # line every five seconds — the doctor reads them, a snapshot needn't keep
 # them) and the doing-marks. Pathspecs; --force takes no notice of an
@@ -111,7 +111,8 @@ def zip_snapshot() -> str:
             if not p.is_file():
                 continue
             rel = p.relative_to(root)
-            if any(part in EXCLUDE_DIRS for part in rel.parts):
+            voice_asset = rel.parts[:2] == (".runtime", "voices")
+            if any(part in EXCLUDE_DIRS for part in rel.parts) and not voice_asset:
                 continue
             zf.write(p, rel)
     # prune old zips, newest kept

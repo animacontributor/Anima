@@ -1,0 +1,6 @@
+# Optional voice auditions; use a separate environment from Chatterbox.
+qwen-tts==0.1.1
+torch==2.10.0
+torchaudio==2.10.0
+soundfile>=0.13,<1
+faster-whisper==1.2.1

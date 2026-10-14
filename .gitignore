@@ -35,3 +35,7 @@ memory/identity_history/*
 
 # Local speech environments, model caches and runtime diagnostics.
 .runtime/
+
+# Local speech environments and exploratory audio work.
+.venv-voice/
+.voice-work/
