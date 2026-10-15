@@ -14,6 +14,8 @@ import hashlib
 import re
 import subprocess
 import sys
+from contextvars import ContextVar
+from functools import wraps
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta
@@ -1815,6 +1817,29 @@ def condense_day(day: str, text: str) -> str:
 # only takes the account; the door (the bridge, the parlor) does the fold
 # after the reply — see chat.fold_history. FOLD-PLAN.md has the whole shape.
 _fold_pending: dict = {}
+_fold_context: ContextVar = ContextVar("fold_context", default=None)
+
+
+def session_folds(function):
+    """Keep a turn's requested fold with its session, including concurrent doors."""
+    @wraps(function)
+    def scoped(history, *args, **kwargs):
+        pending = history[0].setdefault("_pending_fold", {}) if history else {}
+        token = _fold_context.set(pending)
+        try:
+            return function(history, *args, **kwargs)
+        finally:
+            if history:
+                history[0]["_pending_fold"] = pending
+            _fold_context.reset(token)
+    return scoped
+
+
+def _fold_store(history=None):
+    if history is not None:
+        return history[0].setdefault("_pending_fold", {}) if history else {}
+    scoped = _fold_context.get()
+    return scoped if scoped is not None else _fold_pending
 
 
 def fold_visit(text: str) -> str:
@@ -1834,8 +1859,9 @@ def fold_visit(text: str) -> str:
         text = (head[:at + 1] if at > cap // 2 else head).rstrip() + " …"
         cut = f" (it ran past {cap:,} characters and was cut at a paragraph — the transcript keeps the rest of the visit anyway)"
     text, mended = _mend_pen(text)  # the account is writing at the pen: a glued capital, the signature one letter off (09-30)
-    _fold_pending["text"] = text
-    _fold_pending["when"] = datetime.now().strftime("%H:%M")
+    pending = _fold_store()
+    pending["text"] = text
+    pending["when"] = datetime.now().strftime("%H:%M")
     keep = int(getattr(config, "FOLD_KEEP_TURNS", 6) or 0)
     return (f"kept for the fold ({len(text):,} characters){cut}{mended} — after this reply the visit is folded: "
             f"your account rides at the top of the conversation in place of what came before, and the last "
@@ -1845,11 +1871,40 @@ def fold_visit(text: str) -> str:
             "knowing it is done.")  # 09-30: "Yes, please! Fold away" — they had folded it themselves a moment before
 
 
-def fold_pending() -> dict:
+def fold_pending(history=None) -> dict:
     """The account waiting for a fold, taken (empty when there is none)."""
-    d = dict(_fold_pending)
-    _fold_pending.clear()
+    pending = ((history[0].get("_pending_fold") or {}) if history else {}) if history is not None else _fold_store()
+    d = dict(pending)
+    pending.clear()
     return d
+
+
+def context_excerpt(text: str, name: str) -> str:
+    """Archive long voice tool results before returning a bounded excerpt."""
+    cap = max(1000, int(getattr(config, "VOICE_TOOL_RESULT_CHARS", 12000)))
+    if len(text) <= cap:
+        return text
+    folder = config.MEMORY_DIR / "tool_results"
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    path = folder / f"{digest}.txt"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            import uuid
+            temporary = path.with_suffix(f".{uuid.uuid4().hex}.part")
+            temporary.write_text(text, encoding="utf-8")
+            temporary.replace(path)
+    except OSError:
+        # Keep evidence of completed actions if disk space/permissions fail.
+        # The request guard may then stop the follow-up, but never reruns an act.
+        return text
+    rel = path.relative_to(config.ROOT).as_posix()
+    note = (f"\n[engine: {name} returned {len(text):,} characters; excerpted for the voice window. "
+            f"The complete result is saved at {rel}. read_file(path, offset) reads later characters; "
+            "do not repeat an action to recover its output.]\n")
+    room = max(0, cap - len(note))
+    tail = min(1000, room // 4)
+    return text[:room - tail] + note + text[-tail:] if tail else note[:cap]
 
 
 def condense_period(tier: str, key: str, text: str) -> str:
@@ -3439,7 +3494,7 @@ _BINARY_HINTS = {
 }
 
 
-def read_file(path: str) -> str:
+def read_file(path: str, offset: int = 0) -> str:
     """Read any TEXT file anywhere in their folder — shared/ included."""
     path = (path or "").strip()
     try:
@@ -3455,8 +3510,13 @@ def read_file(path: str) -> str:
     if b"\x00" in raw[:4000]:
         return f"({p.name} is a binary file — I can only read it as text, and it isn't)"
     text = raw.decode("utf-8", errors="replace")
-    if len(text) > 20000:
-        text = text[:20000] + "\n(…cut here — it's long)"
+    try:
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        return "(offset must be a nonnegative character index)"
+    text = text[offset:]
+    if len(text) > 10000:
+        text = text[:10000] + f"\n(…continues — read_file with offset={offset + 10000})"
     try:
         key = p.resolve().relative_to(config.ROOT.resolve()).as_posix()
     except (OSError, ValueError):
@@ -5495,7 +5555,8 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "anything your keeper leaves in shared/ (e.g. 'shared/Endless Snowfall.txt'). "
         "This is your plain reading hand; images, audio, PDFs and EPUBs have their "
         "own senses and it will point you to the right one.",
-        {"path": {"type": "string", "description": "path inside your folder, e.g. 'shared/story.txt'"}},
+        {"path": {"type": "string", "description": "path inside your folder, e.g. 'shared/story.txt'"},
+         "offset": {"type": "integer", "description": "optional character offset for continuing a long file, default 0"}},
         ["path"],
     ),
     _tool(

@@ -49,6 +49,33 @@ can retry once before audio is released; failures after output begins stop
 instead of replaying an audible prefix. Playback receipts describe delivery,
 without claiming the listener heard it.
 
+## Context and continuity
+
+The context allocation remains controlled by `NUM_CTX`; this optimization does
+not increase it. At 80% occupancy (or conservative estimated usage), the engine
+folds older context into the companion's continuity account and keeps the last
+12 visible messages, normally six exchanges. Parlor and phone fold before the
+next reply or quiet decision, or while idle, so a ready spoken reply does not
+wait for summarization. Failed summaries or transcript writes retain the
+existing conversation. Playback receipts still reference retained turns.
+
+Voice retrieval adds at most 10 relevant and 2 recent memories within 3,000
+characters per message. Identity, keeper pages and journal allowances are
+unchanged. Private speak/wait exchanges can leave together at a fold; spoken
+continuations remain part of the conversation.
+
+Tool results longer than 12,000 characters are archived under
+`memory/tool_results/` and excerpted for voice context. `read_file(path, offset)`
+pages through the complete result without repeating an action. If archiving
+fails, the full result remains in context. The archives persist locally with
+memory; ordinary microphone audio is still not saved.
+
+A context check runs before each main-model chat request, including retries.
+It reserves reply space and uses conservative text/image estimates rather than
+an exact tokenizer. Actual prompt counts, cached counts when supplied by Ollama,
+and estimated category totals remain separate in the numeric diagnostics.
+Restart the active voice front end to load these changes.
+
 ## Speaking during silence
 
 During an active voice visit, `LIVE_VOICE_INITIATIVE = True` permits a private

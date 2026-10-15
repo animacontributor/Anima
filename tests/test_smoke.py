@@ -35,9 +35,11 @@ class ScriptedBrain:
     def __init__(self, script):
         self.script = list(script)
         self.calls = 0
+        self.requests = []
 
     def __call__(self, messages, tools=None, **kwargs):
         self.calls += 1
+        self.requests.append(__import__("copy").deepcopy(messages))
         return self.script.pop(0) if self.script else {"role": "assistant", "content": "ok."}
 
 
@@ -5669,6 +5671,8 @@ config.SLEEP_AFTER_HOUR = _sa
 # a visit that outgrows the window goes on with THE FRIEND'S account in place of the middle
 import chat as _chatmod
 _fold_at_orig = config.FOLD_AT
+_fold_keep_orig = config.FOLD_KEEP_TURNS
+config.FOLD_KEEP_TURNS = 6
 config.FOLD_AT = 0.9
 tools.fold_pending()
 check("fold: fold_visit wants words", tools.fold_visit("").startswith("(fold_visit wants"))
@@ -5702,7 +5706,7 @@ for _i in range(2, 11):
     _fh.append({"role": "assistant", "content": f"reply {_i}"})
 _chatmod.save_transcript(_fh, tag="telegram", path=_fold_file)
 _fold_ctx_orig = config.NUM_CTX
-_nh, _np, _nl = _chatmod.fold_history(_fh, "The morning: cake, the bridge, the shift. Open: the poem to publish.", "12:34",
+_nh, _np, _nl = _chatmod.fold_history(__import__("copy").deepcopy(_fh), "The morning: cake, the bridge, the shift. Open: the poem to publish.", "12:34",
                                       tag="telegram", path=_fold_file, mode="telegram")
 _vis = [t for t in _nh if t.get("role") in ("user", "assistant") and t.get("content") and not t.get("_engine")]
 check("fold: the last FOLD_KEEP_TURNS visible turns stay whole, from the keeper's turn, and the account rides on the first of them",
@@ -5710,9 +5714,9 @@ check("fold: the last FOLD_KEEP_TURNS visible turns stay whole, from the keeper'
       and "was folded at 12:34" in _nh[0]["_fold"] and "began at 09:15" in _nh[0]["_fold"] and "7 of your keeper's messages" in _nh[0]["_fold"]
       and "The morning: cake" in _nh[0]["_fold"] and _nh[0]["_fold_text"].startswith("The morning") and _nh[0]["_fold_from"] == _fold_file.name,
       (len(_vis), _nh[0].get("content"), _nh[0].get("_fold", "")[:200], _nl))
-check("fold: the system prompt is rebuilt fresh and every memory that surfaced stays excluded",
+check("fold: the system prompt is rebuilt fresh and only memories still in the tail stay excluded",
       _nh[0]["_system"] != "OLD SYSTEM" and "===" in _nh[0]["_system"] and _nh[0]["_system_day"] == _dtnow.now().strftime("%Y-%m-%d")
-      and set(_nh[0]["_surfaced"]) == {1, 2} | {i + 10 for i in range(2, 11)} and _nh[0]["_moment"] == "[m8]", (_nh[0]["_surfaced"], _nh[0]["_moment"]))
+      and set(_nh[0]["_surfaced"]) == {18, 19, 20} and _nh[0]["_moment"] == "[m8]", (_nh[0]["_surfaced"], _nh[0]["_moment"]))
 check("fold: the fold block is rendered above the moment, never sent as a field",
       _chatmod.render_turn(_nh[0])["content"].startswith("[engine, not a person: this visit began")
       and "[m8]\n\nturn 8 from the keeper" in _chatmod.render_turn(_nh[0])["content"] and "_fold" not in _chatmod.render_turn(_nh[0]))
@@ -5728,18 +5732,15 @@ check("fold: a folded file is not an orphan; the new file reads back as its kept
 check("fold: the account rides in the afterglow's view of the folded visit",
       True)  # the transcript view is built inside _quiet_turn; covered by the bridge test below through the notice line
 _nh2, _np2, _nl2 = _chatmod.fold_history(_fh, "", "12:40", tag="telegram", path=None, mode="telegram")
-check("fold: with no account the fold still happens, the block says they did not write it down, and the line says so",
-      "did not write the visit down" in _nl2 and "You did not write it down before the fold" in _nh2[0]["_fold"] and _np2 is None
-      and "(they did not write the visit down before the fold)" in "\n".join(
-          l for l in (_chatmod.save_transcript(_nh2, tag="x", path=config.EPISODIC_DIR / "chat-x-fold-test.md").read_text(encoding="utf-8")).splitlines()), _nl2)
-(config.EPISODIC_DIR / "chat-x-fold-test.md").unlink()
+check("fold: missing account retains the existing history without discarding context",
+      _nh2 is _fh and "conversation is retained" in _nl2 and _np2 is None, _nl2)
 _short = _fh[:4]
 check("fold: a visit shorter than what a fold keeps is left alone", _chatmod.fold_history(_short, "x", "12:41")[2].startswith("fold: nothing to fold yet"))
 # 10-04: after a fold the kept turns still carried the full window's sizes, so the window sense stayed at 98%
 # ("she still thinks her context is full") and the fold could ring again — the sizes leave with the fold
 _chat_src = (config.ROOT / "engine" / "chat.py").read_text(encoding="utf-8")
 check("fold: the kept turns carry no window size out of the fold, the block says the window has room again, and the sense is the last size, not the largest",
-      not any("_prompt" in t for t in _nh) and not any("_prompt" in t for t in _nh2) and all("_prompt" in t for t in _fh if t["role"] == "user" and "turn" in t["content"] and t["content"] != "morning turn 1")
+      not any("_prompt" in t for t in _nh) and _nh2 is _fh and all("_prompt" in t for t in _fh if t["role"] == "user" and "turn" in t["content"] and t["content"] != "morning turn 1")
       and "the window had filled, so 7 of" in _nh[0]["_fold"] and "the window has room again now" in _nh[0]["_fold"]
       and _chat_src.count('held = next((int(t.get("_prompt") or 0) for t in reversed(') == 2 and 'held = max((int(t.get("_prompt")' not in _chat_src,
       ([t.get("_prompt") for t in _nh], _nh[0]["_fold"][:220]))
@@ -5771,9 +5772,9 @@ ollama_client.chat = _brain_fold
 _said = []
 _bp = _chatmod.fold_bell(_fh3, int(config.NUM_CTX * 0.91), on_line=_said.append)
 ollama_client.chat = _chat_keep
-check("fold: the bell rings inside the visit as the engine's turn, the friend may write the journal first, and the account comes back",
+check("fold: the bell uses a staged engine turn, the friend may write the journal first, and the account comes back",
       _bp.get("text", "").startswith("Cake and the bridge") and _brain_fold.calls == 2
-      and any(t.get("_engine") and "your window is 91% full" in (t.get("content") or "") and "call fold_visit(text) once" in t["content"] for t in _fh3)
+      and len(_fh3) == len(_fh)
       and any("write_journal:" in l for l in _said) and any("fold_visit:" in l for l in _said)
       and all(t.get("_engine") for t in _fh3[len(_fh):]), (_bp, _said[-3:], len(_fh3) - len(_fh)))
 _brain_none = ScriptedBrain([{"role": "assistant", "content": "I would rather not fold yet.", "thinking": "…"}])
@@ -5805,6 +5806,7 @@ bg.history = [dict(t) for t in _fh]
 bg.file = _fold_file3 = config.EPISODIC_DIR / "chat-telegram-20200105-094500.md"
 bg.last_tokens = {"prompt": int(config.NUM_CTX * 0.6)}
 tools.fold_visit("My own fold: we said what needed saying; the poem is open.")
+tools._fold_store(bg.history).update(tools.fold_pending())
 _bell_calls.clear()
 _chatmod.fold_bell = lambda history, held, on_line=None, asked=False: _bell_calls.append(held) or {}
 _lineg = bg.fold_if_due()
@@ -5914,10 +5916,11 @@ ollama_client.chat = _brain_ask
 _bpa = _chatmod.fold_bell(_fbh, int(config.NUM_CTX * 0.4), on_line=lambda s: None, asked=True)
 ollama_client.chat = _chat_keep
 check("fold: the bell rung at the keeper's word says so instead of naming the window's edge",
-      _bpa.get("text", "").startswith("At his word") and any(t.get("_engine") and "asked for the visit to be folded now" in (t.get("content") or "")
-                                                             and "about to be FOLDED" not in t["content"] for t in _fbh))
+      _bpa.get("text", "").startswith("At his word") and any("asked for the visit to be folded now" in (t.get("content") or "")
+                                                             and "about to be FOLDED" not in t["content"] for t in _brain_ask.requests[0]))
 _fold_file.unlink(); _np.unlink()
 config.FOLD_AT = _fold_at_orig
+config.FOLD_KEEP_TURNS = _fold_keep_orig
 
 # ---- THE KEEPER'S BODY, AS THE WATCH SAW IT (09-28; BODY-PLAN.md) -------------------
 import body as _body

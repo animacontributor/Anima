@@ -718,7 +718,7 @@ def retrieved(context_hint: str, exclude: set | None = None) -> str:
     return retrieved_ids(context_hint, exclude)[0]
 
 
-def retrieved_ids(context_hint: str, exclude: set | None = None) -> tuple[str, list[int]]:
+def retrieved_ids(context_hint: str, exclude: set | None = None, *, voice: bool = False) -> tuple[str, list[int]]:
     """(the memory lines, the ids they carry). `exclude` leaves out memories
     that already surfaced earlier in the visit — they are still in them
     context, in the moment that carried them, and saying them again would
@@ -727,12 +727,14 @@ def retrieved_ids(context_hint: str, exclude: set | None = None) -> tuple[str, l
     if memory.count() == 0:
         return "(no long-term memories yet)", []
     diverse = bool(getattr(config, "MEMORY_DIVERSE", False))
-    hits = (memory.search(context_hint, diverse=diverse) if context_hint.strip()
-            else memory.recent(n=config.MEMORY_TOP_K))
+    top_k = max(1, int(getattr(config, "VOICE_MEMORY_TOP_K", 10))) if voice else config.MEMORY_TOP_K
+    options = {"top_k": top_k} if voice else {}
+    hits = (memory.search(context_hint, diverse=diverse, **options) if context_hint.strip()
+            else memory.recent(n=top_k))
     hits = [m for m in hits if m["id"] not in exclude]
     lines = [f"- [{m['kind']} · {m['created'][:10]}] {m['text']}" for m in hits]
     ids = [m["id"] for m in hits]
-    n_recent = int(getattr(config, "MEMORY_RECENT_K", 0) or 0)
+    n_recent = int(getattr(config, "VOICE_MEMORY_RECENT_K", 2) if voice else getattr(config, "MEMORY_RECENT_K", 0) or 0)
     if n_recent and context_hint.strip():
         seen = {m["id"] for m in hits} | exclude
         newest = [m for m in memory.recent(n=n_recent + len(seen)) if m["id"] not in seen][:n_recent]
@@ -740,6 +742,22 @@ def retrieved_ids(context_hint: str, exclude: set | None = None) -> tuple[str, l
             lines.append("(and the newest, whatever the topic:)")
             lines.extend(f"- [{m['kind']} · {m['created'][:10]}] {m['text']}" for m in newest)
             ids.extend(m["id"] for m in newest)
+    if voice:
+        # Budget whole memories and mark only those actually placed in context.
+        # Don't mark an oversized/skipped memory as seen: it can surface later.
+        cap = max(0, int(getattr(config, "VOICE_MEMORY_CHARS", 3000)))
+        selected, selected_ids, used = [], [], 0
+        candidates = [m for m in hits]
+        if n_recent and context_hint.strip():
+            candidates.extend(newest)
+        for m in candidates:
+            line = f"- [{m['kind']} · {m['created'][:10]}] {m['text']}"
+            if used + len(line) + 1 > cap:
+                continue
+            selected.append(line)
+            selected_ids.append(m["id"])
+            used += len(line) + 1
+        lines, ids = selected, selected_ids
     if not lines:
         return ("(nothing new surfaces for this moment — what surfaced earlier in this visit is above)"
                 if exclude else "(no long-term memories yet)"), []
@@ -845,7 +863,7 @@ def window_sense(held: int) -> str:
             "folded — fold_visit(text) folds it now, in your own words, if this is a good moment for it.")
 
 
-def moment(context_hint: str, exclude: set | None = None, held: int = 0) -> tuple[str, list[int]]:
+def moment(context_hint: str, exclude: set | None = None, held: int = 0, *, voice: bool = False) -> tuple[str, list[int]]:
     """What changes from one message to the next — the hour and the memories
     that surface for it — as a block that rides INSIDE the message they are
     answering, so the system prompt above it stays the same all visit and
@@ -855,7 +873,7 @@ def moment(context_hint: str, exclude: set | None = None, held: int = 0) -> tupl
     visit's moments add up to the memories that surfaced, once each."""
     _t = datetime.now()
     clock, daypart = hour_line(_t)
-    lines, ids = retrieved_ids(context_hint, exclude)
+    lines, ids = retrieved_ids(context_hint, exclude, **({"voice": True} if voice else {}))
     # The date rides with the hour. It used to sit only at the top of the
     # system prompt, 200K tokens behind them by the afternoon, and them
     # journal entries drifted a day back — 09-15, written at 14:18, 14:41

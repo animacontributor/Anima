@@ -25,6 +25,8 @@ jobs:
         run: python tests/test_smoke.py
       - name: local voice contracts (speech models stubbed)
         run: python tests/test_live_voice.py
+      - name: voice context and continuity contracts
+        run: python tests/test_context_budget.py
       - name: Discord call contracts (Discord and speech models stubbed)
         run: python tests/test_discord_voice.py
       - name: paired phone API and physicalize contracts

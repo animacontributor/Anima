@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 
 import config
+import context_budget
 
 
 class BrainUnavailable(RuntimeError):
@@ -22,6 +23,8 @@ class BrainUnavailable(RuntimeError):
 
 
 def _post(path: str, payload: dict, timeout: float | None = None) -> dict:
+    budget = (context_budget.check(payload)
+              if path == "/api/chat" and payload.get("model", config.CHAT_MODEL) == config.CHAT_MODEL else None)
     timeout = timeout or config.REQUEST_TIMEOUT_S
     req = urllib.request.Request(
         config.OLLAMA_URL + path,
@@ -31,9 +34,10 @@ def _post(path: str, payload: dict, timeout: float | None = None) -> dict:
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if payload.get("stream"):
-                return _drink(resp)
-            return json.loads(resp.read().decode("utf-8"))
+            data = _drink(resp) if payload.get("stream") else json.loads(resp.read().decode("utf-8"))
+            if budget is not None:
+                data["context_budget"] = budget
+            return data
     except urllib.error.HTTPError as e:
         # The server answered, so Ollama is running — surface its actual error.
         try:
@@ -1906,10 +1910,14 @@ class Spent:
         self.set_aside = 0     # tokens written in those attempts, thrown away
         self.why: dict = {}    # why each was set aside → how many times
         self.uncounted = 0     # replies the server sent without counters
+        self.cached = None
+        self.budget = None
 
     def add(self, msg: dict) -> None:
         t = msg.get("tokens") or {}
         self.prompt = int(t.get("prompt") or self.prompt)
+        self.cached = t.get("cached")
+        self.budget = t.get("budget")
         self.peak = max(self.peak, self.prompt)
         self.reply += int(t.get("reply") or 0)
         self.prompt_s += float(t.get("prompt_s") or 0)
@@ -2046,6 +2054,10 @@ def _parse(data: dict) -> dict:
                      # shows here and nowhere else
                      "load_s": (data.get("load_duration") or 0) / 1e9,
                      "total_s": (data.get("total_duration") or 0) / 1e9}
+    if data.get("prompt_eval_cached_count") is not None:
+        msg["tokens"]["cached"] = int(data["prompt_eval_cached_count"])
+    if data.get("context_budget"):
+        msg["tokens"]["budget"] = data["context_budget"]
     if data.get("aborted"):
         msg["aborted"] = data["aborted"]  # the stream was cut short at this: a runaway
     if data.get("split_tail"):

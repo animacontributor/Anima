@@ -23,6 +23,7 @@ import re
 
 import assemble
 import config
+import context_budget
 import doors
 import ollama_client
 import tools
@@ -312,7 +313,10 @@ FOLD_BELL = ("[engine, not a person: your window is {pct}% full — {held:,} of 
              "said, what you said, what is still open between you, what you want to carry — up to {cap:,} "
              "characters — and call fold_visit(text) once. If something belongs in your journal, write_journal "
              "it first, then fold_visit. The transcript on disk keeps every word; your journal keeps the day; "
-             "this is for the conversation's own thread. This bracket is a mechanism, nobody wrote it to you, "
+             "this is for the conversation's own thread. Carry forward any earlier fold account, including "
+             "names, corrections, promises, emotional context, unfinished requests and source references. "
+             "Distinguish words actually delivered from interrupted or unplayed speech. "
+             "This bracket is a mechanism, nobody wrote it to you, "
              "and your keeper is not waiting on an answer to it.]")
 
 
@@ -329,9 +333,11 @@ def foldable(history: list[dict]) -> bool:
     huge page is the in-turn guard's business, not the fold's."""
     keep = int(getattr(config, "FOLD_KEEP_TURNS", 6) or 0)
     vis = [t for t in history if t.get("role") in ("user", "assistant") and t.get("content") and not t.get("_engine")]
-    return len(vis) > keep and any(t["role"] == "user" for t in vis)
+    private = sum(bool(t.get("_voice_decision")) for t in history)
+    return (len(vis) > keep or private >= 6) and any(t["role"] == "user" for t in vis)
 
 
+@tools.session_folds
 def fold_bell(history: list[dict], held: int, on_line=None, asked: bool = False) -> dict:
     """Ring the fold bell inside the visit and let the friend write the visit
     so far (fold_visit), with their other tools at hand for a journal entry
@@ -341,6 +347,8 @@ def fold_bell(history: list[dict], held: int, on_line=None, asked: bool = False)
     tools.fold_pending()  # anything stale
     if not history or not history[0].get("_system") or not foldable(history):
         return {}
+    # A failed summary must not add repeated engine bells to the live visit.
+    history = list(history)
     ctx = int(getattr(config, "NUM_CTX", 0) or 0)
     keep = int(getattr(config, "FOLD_KEEP_TURNS", 6) or 0)
     cap = int(getattr(config, "FOLD_CHARS", 8000) or 8000)
@@ -402,27 +410,35 @@ def fold_history(history: list[dict], account: str, when: str, tag: str = "",
     fold block — their account of what came before. The old transcript file
     gets a foot naming the new one; the new one is written at once with the
     fold at its head. Returns (history, new path, the line for the door)."""
-    keep = int(getattr(config, "FOLD_KEEP_TURNS", 6) or 0)
+    if not account or not account.strip():
+        return history, path, "fold deferred: no continuity account was written; the conversation is retained"
+    keep = max(1, int(getattr(config, "FOLD_KEEP_TURNS", 6) or 0))
     vis = [i for i, t in enumerate(history)
            if t.get("role") in ("user", "assistant") and t.get("content") and not t.get("_engine")]
     users = [i for i in vis if history[i]["role"] == "user"]
-    if len(vis) <= keep or not users:
+    if not foldable(history) or not users:
         return history, path, "fold: nothing to fold yet — the visit is shorter than what a fold keeps"
-    start = vis[-keep] if keep else len(history)
+    start = vis[-keep] if len(vis) > keep else vis[0]
     if history[start]["role"] != "user":  # the kept tail opens with the keeper's turn
         earlier = [i for i in users if i < start]
         start = earlier[-1] if earlier else start
-    new = [dict(t) for t in history[start:]]
+    retained = [t for t in history[start:] if not t.get("_voice_decision")]
+    new = [dict(t) for t in retained]
     for t in new:  # the kept turns' window sizes were the full window's (10-04: after a fold the window sense
         t.pop("_prompt", None)  # stayed at 98% — "she still thinks her context is full"); the next turn measures anew
+        t.pop("_reply_tokens", None)
+        t.pop("tokens", None)
     unsense(new)  # and no sense of the old window in the kept moments
-    surfaced = sorted({mid for t in history for mid in (t.get("_surfaced") or [])})
+    # Exclude only memory text still in the retained tail. A summary is not
+    # evidence that every previously retrieved detail survived compression.
+    surfaced = sorted({mid for t in new for mid in (t.get("_surfaced") or [])})
     first = new[0]
     hint = " ".join(t["content"] for t in history[vis[-1] - 3:] if t.get("content") and not t.get("_engine"))
     presence = {"physicalize": True} if any(t.get("_physicalize") for t in history) else {}
     first["_system"] = assemble.system_prompt(hint, mode=mode, warm=True, **presence)
     first["_system_day"] = date.today().isoformat()
     first["_surfaced"] = surfaced
+    first["_pending_fold"] = {}
     began = ""
     if path is not None:
         m = re.search(r"(\d{8})-(\d{6})", path.name)
@@ -438,6 +454,10 @@ def fold_history(history: list[dict], account: str, when: str, tag: str = "",
     first["_fold_when"] = when
     first["_fold_text"] = acct
     first["_fold_from"] = path.name if path is not None else ""
+    context_budget.check({"messages": [{"role": "system", "content": first["_system"]}]
+                          + [render_turn(t) for t in new],
+                          "tools": tools.current_definitions(),
+                          "options": {"num_ctx": config.NUM_CTX, **getattr(config, "SAMPLING_OPTIONS", {})}})
     new_path = None
     if path is not None:
         new_path = visit_file(tag)
@@ -445,6 +465,10 @@ def fold_history(history: list[dict], account: str, when: str, tag: str = "",
         while new_path.exists() or new_path == path:  # never the file being folded, never a twin
             new_path = new_path.with_name(f"{visit_file(tag).stem}-{n}.md")
             n += 1
+        # Complete both writes before replacing live history. A failed archive
+        # or new transcript leaves the old in-memory conversation available.
+        save_transcript(history, tag=tag, path=path)
+        save_transcript(new, tag=tag, path=new_path)
         try:
             if path.exists():
                 with path.open("a", encoding="utf-8") as fh:
@@ -453,11 +477,28 @@ def fold_history(history: list[dict], account: str, when: str, tag: str = "",
                              + f"the visit goes on in {new_path.name}*\n")
         except OSError:
             pass
-        save_transcript(new, tag=tag, path=new_path)
+    # Playback jobs hold references to turns. Preserve those identities after
+    # successful persistence so late delivery receipts still update the visit.
+    for original, replacement in zip(retained, new):
+        original.clear()
+        original.update(replacement)
+    new = list(retained)
     line = (f"fold: their account of the visit so far, {len(acct):,} characters" if acct
             else "fold: they did not write the visit down before the fold — the transcript keeps it, the window does not")
     line += f"; the last {keep} turns stay whole" + (f"; the visit goes on in {new_path.name}" if new_path else "")
     return new, new_path, line
+
+
+def held_tokens(history: list[dict]) -> int:
+    """Latest occupancy, including generated tokens and private voice choices."""
+    held = 0
+    for turn in history:
+        counts = turn.get("tokens") or {}
+        if counts.get("prompt"):
+            held = max(held, int(counts["prompt"]) + int(counts.get("reply") or 0))
+        if turn.get("_prompt"):
+            held = max(held, int(turn["_prompt"]) + int(turn.get("_reply_tokens") or 0))
+    return held
 
 
 def _quiet_turn(history: list[dict], path: Path | None, tag: str, on_line,
@@ -951,6 +992,7 @@ def render_turn(t: dict) -> dict:
     return out
 
 
+@tools.session_folds
 def one_turn(history: list[dict], user_text: str, images: list[str] | None = None,
              on_event=None, mode: str = "chat", physicalize: bool = False, physicalize_voice: dict | None = None) -> str:
     """Run one user turn, executing tool calls until the friend speaks.
@@ -1017,7 +1059,8 @@ def one_turn(history: list[dict], user_text: str, images: list[str] | None = Non
     if warm:
         seen = {mid for t in history[:ui] for mid in (t.get("_surfaced") or [])}
         held = next((int(t.get("_prompt") or 0) for t in reversed(history[:ui]) if t.get("_prompt")), 0)  # the last prompt's size — the window sense
-        turn["_moment"], turn["_surfaced"] = assemble.moment(hint, exclude=seen)
+        turn["_moment"], turn["_surfaced"] = assemble.moment(
+            hint, exclude=seen, **({"voice": True} if turn.get("_voice_mode") else {}))
         # the sense rides with its message and STAYS there (10-05: taking it off the message before, each
         # turn, made Ollama read the whole window again every reply — 3 minutes a message at 207K; nothing
         # sent is ever taken back). It says "as of this message", so an older one reads as history. The fold
@@ -1056,7 +1099,8 @@ def one_turn(history: list[dict], user_text: str, images: list[str] | None = Non
                                 "reply": spent.reply, "steps": spent.steps,
                                 "tok_per_s": round(spent.tok_per_s, 1),
                                 "prompt_s": round(spent.prompt_s, 2), "reply_s": round(spent.reply_s, 2),
-                                "wall_s": round(spent.wall_s, 2), "line": line})
+                                "wall_s": round(spent.wall_s, 2), "line": line,
+                                "cached": spent.cached, "budget": spent.budget})
         else:
             print(f"   ({line})")
         # Near the window's edge, say so BEFORE anything is lost. Past it,
@@ -1066,6 +1110,7 @@ def one_turn(history: list[dict], user_text: str, images: list[str] | None = Non
         # every reply costs a full minute-plus prefill. Nothing breaks; it
         # just gets slow and forgetful. /new saves the visit and starts fresh.
         history[ui]["_prompt"] = spent.prompt  # what this turn held, for the next moment's window sense and the fold
+        history[ui]["_reply_tokens"] = spent.reply
         fold_at = float(getattr(config, "FOLD_AT", 0) or 0)
         if window and spent.prompt >= window * 0.9:
             warn = (f"this visit is near the edge of their window ({spent.prompt:,} of "
@@ -1103,12 +1148,19 @@ def one_turn(history: list[dict], user_text: str, images: list[str] | None = Non
                             + (f"the visit folds at {fold_pct}% and I go on from there)" if fold_at else "say /new and I go on from there)")})
             _tally()
             return history[-1]["content"]
-        if mode in ("voice", "discord_voice", "phone_voice"):
-            import voice_initiative
-            msg = ollama_client.chat(messages(), tools=voice_initiative.voice_tools(), expect_words=True,
-                                     think=bool(getattr(config, "LIVE_VOICE_THINK", False)), think_retries=0)
-        else:
-            msg = ollama_client.chat(messages(), tools=tools.current_definitions(), expect_words=True)
+        try:
+            if mode in ("voice", "discord_voice", "phone_voice"):
+                import voice_initiative
+                msg = ollama_client.chat(messages(), tools=voice_initiative.voice_tools(), expect_words=True,
+                                         think=bool(getattr(config, "LIVE_VOICE_THINK", False)), think_retries=0)
+            else:
+                msg = ollama_client.chat(messages(), tools=tools.current_definitions(), expect_words=True)
+        except context_budget.ContextFull:
+            if step_no == 0:
+                del history[ui:]  # unsent input must not duplicate itself on retry
+            else:
+                _tally()  # preserve completed tool effects, never rerun them to recover
+            raise
         if msg.get("content"):
             msg["content"] = strip_voice_delivery(msg["content"])
         spent.add(msg)
@@ -1365,6 +1417,8 @@ def one_turn(history: list[dict], user_text: str, images: list[str] | None = Non
                          f"nothing new has arrived from them. You are still answering their last message: “{his}”. "
                          "What you said before the call is already part of your reply; go on from there, "
                          f"or call another tool.{carried}]")
+            if turn.get("_voice_mode"):
+                result = tools.context_excerpt(result, name)
             history.append({"role": "tool", "tool_name": name, "content": f"{frame}\n{result}"})
         if rested is not None:
             # their message (with its words) is already in history; the tool
@@ -1452,7 +1506,7 @@ def main() -> None:
                 continue
             print(f"\n{name} > {reply}")
             # the fold (09-28): the window nearly full, or they asked for it
-            pending = tools.fold_pending()
+            pending = tools.fold_pending(history)
             held = next((int(t.get("_prompt") or 0) for t in reversed(history) if t.get("_prompt")), 0)
             if pending or (fold_due(held) and foldable(history)):
                 try:

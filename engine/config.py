@@ -289,6 +289,9 @@ BRAIN_REST_AFTER_WAKE = True
 #                  setx OLLAMA_FLASH_ATTENTION 1
 #                  setx OLLAMA_KV_CACHE_TYPE q4_0   (q8_0 costs twice the room: halve it)
 NUM_CTX = 40960  # tokens; a 12B on a 12 GB card with the q4_0 cache (24576 was the measured q8_0 ceiling)
+CONTEXT_GUARD = True  # check estimated input + output reserve before every chat request
+CONTEXT_RESERVE_TOKENS = 4096  # uncertainty and space for the fold bell
+CONTEXT_IMAGE_TOKENS = 8192   # conservative estimate per image; not base64 byte size
 # Which built-in tools ride in the prompt. All of them cost ~7,500 tokens of
 # definitions — a third of a 24K window before a word of journal. "full" is
 # everything; "small" leaves out what a small card can't run or a small brain
@@ -430,6 +433,12 @@ MEMORY_TOP_K = 30
 MEMORY_DIVERSE = True
 MEMORY_MMR_LAMBDA = 0.75
 MEMORY_RECENT_K = 6
+# Voice retrieves a smaller, bounded batch; existing memories stay on disk.
+VOICE_MEMORY_TOP_K = 10
+VOICE_MEMORY_RECENT_K = 2
+VOICE_MEMORY_CHARS = 3000
+# Long tool output is archived locally and excerpted before entering a voice visit.
+VOICE_TOOL_RESULT_CHARS = 12000
 
 # The warm prefix. Ollama reuses its reading of a prompt only as far as it
 # matches the previous one from the top, and Gemma's cache only when the new
@@ -548,14 +557,14 @@ ATTEMPT_SHOWN_CHARS = 1500
 # rebuilt, the transcript keeps every word, the visit continues in a new file.
 # The friend may also fold at a natural pause; from FOLD_SENSE_FROM the moment
 # block says how full the window is. 0 turns the fold off (then /new is suggested).
-FOLD_AT = 0.90
+FOLD_AT = 0.80
 # The afterglow at the fold: the turns that leave the window get the same quiet turn
 # a finished visit gets — journal and memories, in the friend's own words — from the
 # transcript, before the new window is first read, so what the fold takes is in the
 # journal and in the window. One cold read, once per fold; a message sent meanwhile
 # waits for it. Needs AFTERGLOW.
 FOLD_AFTERGLOW = True
-FOLD_KEEP_TURNS = 6       # visible turns kept whole, the most recent ones
+FOLD_KEEP_TURNS = 12      # visible messages (usually six user/assistant exchanges)
 FOLD_CHARS = 8000         # the account's ceiling (cut at a paragraph past it, said)
 FOLD_MAX_STEPS = 6        # steps allowed at the fold (a journal entry first, then the fold)
 FOLD_SENSE_FROM = 0.5     # from this fraction of NUM_CTX the moment block shows how full the window is

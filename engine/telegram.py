@@ -61,6 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import chat
 import memory
 import config
+import context_budget
 import doors
 import ollama_client
 import tools
@@ -1017,8 +1018,13 @@ class Bridge:
         themselves — the visit is folded: their account of it so far in place of
         the middle, the last turns whole, a new transcript file. The bell,
         when it is the engine's call, rings first so the account is theirs."""
-        pending = tools.fold_pending()
-        held = int((self.last_tokens or {}).get("prompt") or 0)
+        pending = tools.fold_pending(self.history)
+        held = max(chat.held_tokens(self.history), int((self.last_tokens or {}).get("prompt") or 0))
+        if self.history and self.history[0].get("_system"):
+            estimate = context_budget.estimate(
+                [{"role": "system", "content": self.history[0]["_system"]}]
+                + [chat.render_turn(t) for t in self.history], tools.current_definitions())
+            held = max(held, estimate["estimated_input"])
         due = chat.fold_due(held) and chat.foldable(self.history)
         if not pending and not due:
             return ""
@@ -1032,13 +1038,13 @@ class Bridge:
             self.send("(nothing to fold yet — the visit is shorter than what a fold keeps)", markdown=False)
             return ""
         held = int((self.last_tokens or {}).get("prompt") or 0)
-        return self._fold(tools.fold_pending(), held, asked=True)
+        return self._fold(tools.fold_pending(self.history), held, asked=True)
 
     def _fold(self, pending: dict, held: int, asked: bool = False) -> str:
         got = self.lock.acquire(timeout=3)
         if not got:
             if pending:
-                tools._fold_pending.update(pending)  # they asked; it waits for the next turn
+                tools._fold_store(self.history).update(pending)  # waits with this session
             if asked:
                 self.send("(they are mid-reply — say /fold again in a moment)", markdown=False)
             return ""
@@ -1049,13 +1055,16 @@ class Bridge:
                 why = "you asked for a fold" if asked else f"the window is {pct}% full"
                 self.notice(f"({why} — they are folding the visit: writing it so far in their own words…)")
                 pending = chat.fold_bell(self.history, held, on_line=_say, asked=asked)
+            if not pending.get("text", "").strip():
+                return "fold deferred: no continuity account was written; the conversation is retained"
             when = pending.get("when") or time.strftime("%H:%M")
             old_history, old_file = self.history, self.file
             self.history, self.file, line = chat.fold_history(self.history, pending.get("text", ""), when,
                                                               tag=self.TAG, path=self.file, mode=self.TAG)
             self.reflected_upto = len(self.history)  # the kept tail was sat with, or is about to be, as new
             self.last_tokens = {}  # the next prompt is a new, smaller one
-            gone = old_history[:len(old_history) - len(self.history)] if self.file != old_file else []
+            retained = {id(t) for t in self.history}
+            gone = [t for t in old_history if id(t) not in retained] if self.file != old_file else []
             if gone and getattr(config, "FOLD_AFTERGLOW", True) and getattr(config, "AFTERGLOW", True):
                 said = self._fold_afterglow(gone, old_file)
                 line += ("; what left the window is written down, and the new window carries it" if said

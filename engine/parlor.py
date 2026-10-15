@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import chat
 import config
+import context_budget
 import doors
 import ollama_client
 import tools
@@ -42,6 +43,8 @@ HOST, PORT = "127.0.0.1", 8765
 class Session:
     """One visit: a history, pending images, and the turn-runner."""
 
+    TAG = ""
+
     def __init__(self) -> None:
         self.history: list[dict] = []
         self.attached: list[str] = []
@@ -53,6 +56,7 @@ class Session:
         self.generation = 0
         self.initiative = voice_initiative.Clock()
         self.voice_inputs = {}
+        self.context_mode = "chat"
 
     def _checkpoint(self) -> None:
         if self.file is None:
@@ -61,6 +65,56 @@ class Session:
             chat.save_transcript(self.history, path=self.file)
         except OSError:
             pass
+
+    def fold_if_due(self, mode=None) -> str:
+        """Called with the session lock, before inference or in an idle pause.
+
+        Never put summarization between a ready reply and its playback.
+        """
+        if not self.history:
+            return ""
+        mode = mode or self.context_mode
+        pending = tools.fold_pending(self.history)
+        held = chat.held_tokens(self.history)
+        system = self.history[0].get("_system", "")
+        definitions = voice_initiative.voice_tools() if "voice" in mode else tools.current_definitions()
+        estimated = context_budget.estimate(
+            [{"role": "system", "content": system}] + [chat.render_turn(t) for t in self.history], definitions)
+        if not pending and not chat.fold_due(max(held, estimated["estimated_input"])):
+            return ""
+        if not chat.foldable(self.history):
+            tools._fold_store(self.history).update(pending)
+            return ""
+        try:
+            old_file = self.file or chat.visit_file(self.TAG)
+            chat.save_transcript(self.history, tag=self.TAG, path=old_file)
+            self.file = old_file
+            print("(making room for the voice visit; keeping its continuity and recent exchanges)")
+            pending = pending or chat.fold_bell(self.history, held or estimated["estimated_input"], on_line=print)
+            if not pending.get("text", "").strip():
+                return "fold deferred: no continuity account was written; the conversation is retained"
+            previous = list(self.history)
+            updated, path, line = chat.fold_history(self.history, pending["text"],
+                pending.get("when") or time.strftime("%H:%M"), tag=self.TAG, path=old_file, mode=mode)
+            if updated is self.history:
+                return line
+            kept = {id(t) for t in updated}
+            gone = [t for t in previous if id(t) not in kept]
+            reflected = sum(id(t) in kept for t in previous[:self.reflected_upto])
+            self.history, self.file, self.reflected_upto = updated, path, reflected
+        except Exception as error:
+            tools._fold_store(self.history).update(pending)
+            return f"fold deferred; conversation retained ({type(error).__name__}: {error})"
+        if (gone and getattr(config, "FOLD_AFTERGLOW", True) and getattr(config, "AFTERGLOW", True)
+                and any(t.get("content") and not t.get("_engine") for t in gone)):
+            try:
+                chat.fold_afterglow(gone, old_file, tag=self.TAG, on_line=print)
+                chat.rewarm(self.history, mode=mode)
+            except Exception as error:
+                line += f"; afterglow deferred ({type(error).__name__})"
+        self._checkpoint()
+        print(line)
+        return line
 
     def send(self, text: str, spoken=False, epoch=None, generation=None,
              mode=None, physicalize=False, physicalize_voice=None, accepted_voice=False) -> dict:
@@ -78,6 +132,10 @@ class Session:
                 return {"error": "The visit ended while audio was being processed; start a new turn."}
             self.last_activity = time.time()
             try:
+                self.context_mode = mode or ("voice" if spoken else "chat")
+                folded = self.fold_if_due(self.context_mode)
+                if folded:
+                    collect("note", folded)
                 beginning = len(self.history)
                 started = time.monotonic()
                 presence = {"physicalize": True} if physicalize else {}
@@ -103,6 +161,9 @@ class Session:
                 self._checkpoint()
                 self.last_activity = time.time()
                 turn_s = time.monotonic() - started
+            except context_budget.ContextFull as e:
+                self._checkpoint()
+                return {"error": str(e)}
             except ollama_client.BrainUnavailable as e:
                 return {"error": f"brain offline — {e}"}
             except Exception as e:  # nothing in one turn ends the visit
@@ -196,6 +257,7 @@ class Session:
                 return {"quiet": True}
             epoch, generation = self.playback.epoch, self.generation
             try:
+                self.fold_if_due(mode)
                 decision, additions = voice_initiative.decide(self.history, claim[2], mode,
                     physicalize=physicalize, physicalize_voice=physicalize_voice)
             except Exception as e:
@@ -318,6 +380,16 @@ class Session:
         """The pause, same as the bridge's: your keeper quiet for REFLECT_AFTER_MIN
         with REFLECT_MIN_TURNS of their messages they haven't sat with → one quiet
         turn over that stretch; the visit stays open."""
+        # Folding remains available even when optional pause reflections are off.
+        with self.initiative.lock:
+            playing = self.initiative.job is not None
+        if not playing and self.lock.acquire(blocking=False):
+            try:
+                folded = self.fold_if_due()
+                if folded:
+                    return folded
+            finally:
+                self.lock.release()
         mins = float(getattr(config, "REFLECT_AFTER_MIN", 0) or 0)
         if not mins or not self.history or time.time() - self.last_activity < mins * 60:
             return ""

@@ -550,6 +550,8 @@ def decide(history, elapsed, mode="voice", physicalize=False, physicalize_voice=
     additions.extend(dict(t, _engine=True) for t in msg.get("sent_extra", []))
     additions.extend([dict(msg, _engine=True), {"role": "tool", "tool_name": "voice_initiative", "_engine": True,
         "content": "[engine: your private choice was accepted; only the chosen spoken text is delivered.]"}])
+    for turn in additions:
+        turn["_voice_decision"] = True  # complete private exchanges can leave together at a fold
     if text:
         additions.append({"role": "assistant", "content": text, "_initiative": True})
     return result, additions

@@ -113,6 +113,8 @@ class Pairing:
 
 
 class PhoneSession(parlor.Session):
+    TAG = "phone"
+
     def __init__(self):
         super().__init__()
         self.lock = threading.RLock()
@@ -283,27 +285,15 @@ class House:
                                   mode="phone_voice" if spoken else "phone", physicalize=physicalize,
                                   accepted_voice=heard is not None,
                                   **({'physicalize_voice':spatial.voice_position(position)} if physicalize and spoken else {}))
-            user = next((t for t in session.history[beginning:] if t.get("role") == "user" and not t.get("_engine")), None)
-            if user:
+            user = next((t for t in reversed(session.history) if t.get("role") == "user" and not t.get("_engine")), None)
+            if user and not result.get("error"):
                 user["_phone_visible"] = visible_text
         if spoken:
             result["transcript"] = visible_text
         for v in result.get("voices", []):
             v["url"] = "/api/voice-note/" + v["url"].rsplit("/", 1)[-1]
-        held = int((result.get("tokens") or {}).get("prompt") or 0)
-        pending = tools.fold_pending()
-        if (pending or chat.fold_due(held)) and chat.foldable(session.history):
-            with session.lock:
-                pending = pending or chat.fold_bell(session.history, held, on_line=print)
-                if pending:
-                    previous, previous_file = session.history, session.file
-                    session.history, session.file, _ = chat.fold_history(session.history, pending.get("text", ""),
-                        pending.get("when") or time.strftime("%H:%M"), tag="phone", path=session.file, mode="phone")
-                    gone = previous[:len(previous) - len(session.history)] if session.file != previous_file else []
-                    if gone and getattr(config, "FOLD_AFTERGLOW", True) and getattr(config, "AFTERGLOW", True):
-                        chat.fold_afterglow(gone, previous_file, tag="phone", on_line=print)
-                        chat.rewarm(session.history, mode="phone")
-                    session._checkpoint()
+        # Session folds before the next inference/quiet check, so this ready
+        # reply reaches playback without waiting for summary and afterglow.
         return result
 
     def warm_voice(self, owner, data):
