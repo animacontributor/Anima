@@ -27,7 +27,7 @@ lists folder names and moves folders the way bat\\skills.bat does, and that is a
 memory/*.json, never to config, and /api/state says only whether one is set.
 
 The routes are plain functions — state(), door_action(), save(), secret(), skill_action(), welcome(),
-pull(), update() — and route() is the one place a request becomes a call; the Handler is a thin
+pull() — and route() is the one place a request becomes a call; the Handler is a thin
 shim over route(). Every process the panel starts goes through _launch(argv, cwd). Standard library
 only; no knob.
 """
@@ -56,11 +56,6 @@ import doors
 import knobs
 import skills
 import version
-
-try:
-    import newer  # the look at GitHub's release feed — a checkout's; a house without the update road has no need of it
-except Exception:  # noqa: BLE001
-    newer = None  # type: ignore[assignment]
 
 HOST, PORT = "127.0.0.1", 8764
 PORTS = (8764, 8766, 8767, 8768, 8769)  # the first free one is this panel's (8765 is the parlor's); a second house's panel takes the next
@@ -696,7 +691,7 @@ _oneoffs = iter(range(1, 1 << 30))
 
 def _oneoff(lines: list[str]) -> Path:
     """A Mac's `open` passes nothing to the file it opens, so a door with arguments (the heartbeat's
-    minutes, update --check, a pull) is a short .command of its own in memory/.pids/, which takes itself
+    minutes, a pull) is a short .command of its own in memory/.pids/, which takes itself
     away as it starts."""
     folder = doors.pid_file("panel").parent
     folder.mkdir(parents=True, exist_ok=True)
@@ -1072,10 +1067,8 @@ def state() -> dict:
         "skills": skills_state(),
         "missing": missing(values),
         "senses": senses_state(values),
-        "update_here": (ROOT / "bat" / "update.bat").is_file(),
         "stone": bool(str(values.get("TOUCHSTONE_URL", getattr(config, "TOUCHSTONE_URL", "")) or "").strip().strip('"')),  # a body on the desk: its door shows on Home
         "folder": ROOT.name,  # which house this panel is — two on one machine look alike
-        "newer": newer_state(),
         "links": {"parlor": PARLOR_URL, "ollama": "https://ollama.com", "readme": f"https://github.com/{repo}#readme",
                   "botfather": f"https://github.com/{repo}#the-bridge-talking-with-them-from-your-phone",
                   "discord": f"https://github.com/{repo}#the-bridge-over-discord",
@@ -1225,7 +1218,7 @@ def door_action(door: str, action: str, minutes=None) -> dict:
     return _no(f"(no such action: {action})")
 
 
-# ---- settings, secrets, skills, the brain, the update ------------------------------------
+# ---- settings, secrets, skills, the brain ------------------------------------
 
 def save(changes: dict, raw: dict | None = None) -> dict:
     """The keeper's Save: {"changed", "refused", "error", "restart"}. `raw` is a list or dict knob as its
@@ -1466,22 +1459,6 @@ def report() -> dict:
             "path": p.name, "text": text}
 
 
-def newer_state() -> dict | None:
-    """What Home says above the tiles when a newer anima is out — from the daily look at the release feed
-    (newer.look: the cache answers between looks; a checkout only). None when there is nothing to say."""
-    if newer is None or not (ROOT / "bat" / "update.bat").is_file():
-        return None
-    try:
-        rec = newer.look()
-        n = newer.newer(rec=rec)
-    except Exception:  # noqa: BLE001 — the look is a courtesy; never the page down
-        return None
-    if not n:
-        return None
-    return {"version": n["version"], "title": n["title"], "date": n["date"], "link": n["link"],
-            "installed": n["installed"], "line": newer.line(n)}
-
-
 def skill_card(folder: Path, quarantined: bool) -> dict:
     """One skill as the page shows it: what it says it is, where it came from and who fetched it, the
     scanner's verdict and every finding (file, line, rule, the words) — the approval desk's whole case."""
@@ -1565,18 +1542,6 @@ def pull(model: str) -> dict:
     return _started(_console("ollama", "pull", model),
                     f"pulling {model} in its own window — several GB; the light turns when it is there",
                     f"the pull of {model} (several GB; the light turns when it is there)")
-
-
-def update(action: str) -> dict:
-    flag = {"check": "--check", "run": "--yes"}.get(str(action or ""))
-    if not flag:
-        return _no(f"(no such action: {action})")
-    if not (ROOT / "bat" / "update.bat").is_file():
-        return _no("(this folder has no bat\\update.bat — it is not an anima checkout)")
-    note = ("the update is looking — what's new and what would change, nothing touched; in its own window"
-            if flag == "--check" else
-            "the update is running in its own window — then restart what's running (the panel too)")
-    return _started(_bat("bat\\update.bat", [flag], "update.py", [flag]), note, f"the update ({flag})")
 
 
 def welcome(name: str, model: str = "") -> dict:
@@ -1670,8 +1635,6 @@ def _post(path: str, g) -> tuple[int, str, bytes]:
             return _json_reply(handy_stop())
         if path == "/api/skill":
             return _json_reply(skill_action(str(g("name") or ""), str(g("action") or "")))
-        if path == "/api/update":
-            return _json_reply(update(g("action")))
         if path == "/api/report":
             return _json_reply(report())
         if path == "/api/open":
@@ -1759,7 +1722,6 @@ ul.findings{margin:4px 0;padding-left:18px;font-size:13px;font-family:ui-monospa
 .skilltext pre{white-space:pre-wrap;max-height:420px;overflow:auto;font-size:12px;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px}
 pre.report{white-space:pre-wrap;max-height:480px;overflow:auto;font-size:12px;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;margin:14px 0}
 #gate{margin:6px 0 0}#gate a{cursor:pointer;text-decoration:underline}
-#newer{margin:6px 0 0;color:var(--fg)}#newer button{margin-left:6px}#newer a{color:inherit}
 .tabs{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:14px;border-bottom:1px solid var(--line);padding-bottom:8px}
 .knob{padding:10px 0;border-bottom:1px solid var(--line)}
 .knob label{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
@@ -1785,7 +1747,7 @@ ul.list{list-style:none;padding:0}ul.list li{display:flex;gap:8px;align-items:ce
 <main>
 <div id="banner" class="banner" hidden></div>
 <section id="welcome" hidden></section>
-<section id="home" hidden><div id="brain" class="bar"></div><p id="newer" class="notice" hidden></p><p id="gate" class="warn" hidden></p><div id="tiles" class="grid"></div><p id="missing" class="muted"></p><div id="lately" hidden></div></section>
+<section id="home" hidden><div id="brain" class="bar"></div><p id="gate" class="warn" hidden></p><div id="tiles" class="grid"></div><p id="missing" class="muted"></p><div id="lately" hidden></div></section>
 <section id="settings" hidden><div id="tabs" class="tabs"></div><div id="tab"></div></section>
 </main>
 <script>
@@ -1840,10 +1802,6 @@ function buildHome(){
     else if(d==='bridge')t.append(secretField('telegram','bot token',S.secrets.telegram),
       el('div',{class:'muted'},el('a',{href:S.links.botfather,target:'_blank',rel:'noopener'},'how to get a token (BotFather)')));
     return t});
-  if(S.update_here)tiles.push(el('div',{class:'tile'},el('h2',{},'Update'),el('div',{class:'what'},'the current engine from GitHub — the friend untouched; Check shows what would change first'),
-      el('div',{class:'row'},el('button',{onclick:async()=>{const r=await post('/api/update',{action:'check'});say(r.note,r.ok?'':'warn')}},'Check'),
-        el('button',{onclick:async()=>{if(!confirm('Update the engine now? Everything replaced goes to .update/ first; bat\\update.bat --undo puts it back.'))return;
-          const r=await post('/api/update',{action:'run'});say(r.note,r.ok?'':'warn')}},'Update'))));
   $('tiles').replaceChildren(...tiles);
   built=true;lately()}
 const KINDS={made:'made',song:'song',page:'page',night:'night',journal:'journal'};
@@ -1868,11 +1826,6 @@ function brainBar(){const b=S.brain,parts=[light(b.reachable),el('b',{},'the bra
     parts.push(el('div',{class:'muted'},'configured: '+b.model+(b.pulled?'':' — not pulled '),b.pulled?null:el('button',{onclick:()=>pull(b.model)},'Pull '+b.model),
       b.embed_pulled?null:[' · memory needs '+b.embed_model+' ',el('button',{onclick:()=>pull(b.embed_model)},'Pull '+b.embed_model)]))}
   $('brain').replaceChildren(...parts);
-  const nw=S.newer;$('newer').hidden=!nw;
-  if(nw)$('newer').replaceChildren('⬆ '+nw.line,...(nw.link?[' · ',el('a',{href:nw.link,target:'_blank',rel:'noopener'},'release notes')]:[]),
-    el('button',{onclick:async()=>{const r=await post('/api/update',{action:'check'});say(r.note,r.ok?'':'warn')}},'Check'),
-    el('button',{class:'primary',onclick:async()=>{if(!confirm('Update to anima '+nw.version+' now? Everything replaced goes to .update/ first; bat\\update.bat --undo puts it back.'))return;
-      const r=await post('/api/update',{action:'run'});say(r.note,r.ok?'':'warn')}},'Update'));
   const held=S.skills.quarantine.length;$('gate').hidden=!held;
   if(held)$('gate').replaceChildren('⚠ '+held+' skill'+(held===1?'':'s')+' waiting at the gate — the scanner held '+(held===1?'it':'them')+'; ',el('a',{onclick:()=>{view='settings';tab='Skills';history.replaceState(null,'','/settings');show()}},'read and decide'),' in Settings › Skills.');
   $('missing').textContent=S.missing.length?('Not installed (optional; each gives one sense): '+S.missing.map(m=>m.pip+' — '+m.for).join(' · ')+'. py -m pip install <name> (python3 -m pip on a Mac or Linux)'):''}

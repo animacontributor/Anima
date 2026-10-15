@@ -7684,9 +7684,9 @@ check("telegram: a newer anima is said on the phone once per version — the lin
 _pst = _p_asked(panel.state)
 _pb = _pst.get("brain", {})
 check("panel: state — the version, a light for every door (the panel one of them), the knobs by tab, the secrets as flags, the skills, what is missing, the links",
-      set(_pst) == {"version", "doors", "brain", "user_name", "welcome", "heartbeat_minutes", "tabs", "secrets", "skills", "missing", "links", "update_here", "folder", "newer", "senses", "stone", "bridge"}
-      and _pst["update_here"] is True and _pst["folder"] == config.ROOT.name
-      and _pst["newer"] and _pst["newer"]["version"] == _nw_next and _pst["newer"]["installed"] == _nw_inst and "release notes" in panel.PAGE and 'id="newer"' in panel.PAGE
+      set(_pst) == {"version", "doors", "brain", "user_name", "welcome", "heartbeat_minutes", "tabs", "secrets", "skills", "missing", "links", "folder", "senses", "stone", "bridge"}
+      and _pst["folder"] == config.ROOT.name
+      and "/api/update" not in panel.PAGE and 'id="newer"' not in panel.PAGE
       and _pst["version"] == version.read(config.ROOT) and list(_pst["doors"]) == list(doors.DOORS) + ["discord"] and "panel" in _pst["doors"]
       and all(v == {"running": False} for v in _pst["doors"].values()) and _pst["secrets"] == {"telegram": False, "discord": False, "brave": False, "handy_connection_key": False, "handy_api_token": False, "handy_application_key": False} and _pst["bridge"] == ""  # no bridge up: no road
       and list(_pst["tabs"]) == [*panel.TABS, "Advanced"] and _pst["heartbeat_minutes"] == 120
@@ -7998,18 +7998,16 @@ panel._WINDOWS = True
 _p_launched.clear()
 _p_win = {d: panel.door_action(d, "start", "30" if d == "heartbeat" else None).get("argv") for d in ("chat", "bridge", "heartbeat", "garmin")}
 _p_win["pull"] = panel.pull("gemma4:31b-it-qat").get("argv")
-_p_win["update"] = panel.update("check").get("argv")
 panel._WINDOWS = False
 check("panel: on Windows each door is its .bat in a console of its own (start \"\"), the heartbeat's loop and a pull in a console that stays open",
       _p_win == {"chat": ["cmd", "/c", "start", "", "bat\\chat.bat"], "bridge": ["cmd", "/c", "start", "", "bat\\telegram.bat"],
                  "heartbeat": ["cmd", "/c", "start", "", "cmd", "/k", "py", "engine\\heartbeat.py", "--loop", "30"],
                  "garmin": ["cmd", "/c", "start", "", "bat\\body.bat", "--login"],
-                 "pull": ["cmd", "/c", "start", "", "cmd", "/k", "ollama", "pull", "gemma4:31b-it-qat"],
-                 "update": ["cmd", "/c", "start", "", "bat\\update.bat", "--check"]}, _p_win)
+                 "pull": ["cmd", "/c", "start", "", "cmd", "/k", "ollama", "pull", "gemma4:31b-it-qat"]}, _p_win)
 _p_launched.clear()
-check("panel: Pull and the Update off Windows; a model name a console could read as more is refused",
-      panel.pull("gemma4:12b")["argv"] == ["ollama", "pull", "gemma4:12b"] and panel.update("run")["argv"] == [sys.executable, "engine/update.py", "--yes"]
-      and not panel.pull("gemma4 & del x")["ok"] and not panel.pull("")["ok"] and not panel.update("now")["ok"] and len(_p_launched) == 2, _p_launched)
+check("panel: Pull off Windows; a model name a console could read as more is refused",
+      panel.pull("gemma4:12b")["argv"] == ["ollama", "pull", "gemma4:12b"]
+      and not panel.pull("gemma4 & del x")["ok"] and not panel.pull("")["ok"] and len(_p_launched) == 1, _p_launched)
 _p_launched.clear()
 doors.mark("heartbeat", "loop 60")
 doors.mark("bridge", "bridge")
@@ -8239,12 +8237,12 @@ _pr_sec = panel.route("POST", "/api/secret", _pjson.dumps({"kind": "brave", "val
 _pr_sk = panel.route("POST", "/api/skill", _pjson.dumps({"name": "panel-none", "action": "approve"}).encode(), _PJ)
 _pr_pull = panel.route("POST", "/api/pull", _pjson.dumps({"model": "gemma4:12b"}).encode(), _PJ)
 _pr_upd = panel.route("POST", "/api/update", _pjson.dumps({"action": "check"}).encode(), _PJ)
-check("panel: the posts through route() — a door, a save, a secret (not said back), a skill, a pull, the update",
+check("panel: the posts through route() — a door, a save, a secret (not said back), a skill, a pull; the removed update endpoint returns 404",
       _pr_door[0] == 200 and _pjson.loads(_pr_door[2])["ok"] and _p_launched[0] == ([sys.executable, "engine/chat.py"], config.ROOT)
       and _pjson.loads(_pr_save[2])["changed"] == ["ODD_KNOB"] and "\nODD_KNOB = 6\n" in panel.CONFIG_FILE.read_text(encoding="utf-8")
       and _pjson.loads(_pr_sec[2])["ok"] and b"BRAVE-two-zz" not in _pr_sec[2] and not _pjson.loads(_pr_sk[2])["ok"]
-      and _p_launched[1][0] == ["ollama", "pull", "gemma4:12b"] and _p_launched[2][0] == [sys.executable, "engine/update.py", "--check"]
-      and _pr_upd[0] == 200, (_pr_door, _pr_save, _p_launched))
+      and _p_launched[1][0] == ["ollama", "pull", "gemma4:12b"] and len(_p_launched) == 2
+      and _pr_upd[0] == 404, (_pr_door, _pr_save, _p_launched))
 _p_launched.clear()
 _p_door = _pjson.dumps({"door": "chat", "action": "start"}).encode()
 _pno = [panel.route("GET", "/", b"", {"Host": "evil.example:8764"})[0],
@@ -8633,15 +8631,13 @@ if _X_POSIX and _xshu.which("bash"):
     check("launchers: bash -n reads every twin without a syntax error", _xr2.returncode == 0, _xr2.stderr)
 
 # the panel on a Mac: each door its .command in Terminal; a door with arguments, a one-off .command
-_x_p0 = (panel._launch, panel._WINDOWS, panel._MAC, panel.TERMINALS, panel._ollama, panel._vram_gb, panel.newer_state)
-panel.newer_state = lambda: None
+_x_p0 = (panel._launch, panel._WINDOWS, panel._MAC, panel.TERMINALS, panel._ollama, panel._vram_gb)
 _x_launched: list = []
 panel._launch = lambda argv, cwd: _x_launched.append((list(argv), Path(cwd)))
 panel._ollama = lambda *a, **k: None
 panel._WINDOWS, panel._MAC = False, True
 _x_mac = {d: panel._bat(*panel.LAUNCHERS[d]) for d in ("chat", "bridge", "parlor", "wake", "garmin", "blog")}
 _x_mac_hb = panel._heartbeat_argv(45)
-_x_mac_upd = panel.update("check")
 _x_mac_pull = panel.pull("gemma4:12b")
 _x_mac_none = panel._bat("bat\\nosuch.bat", [], "chat.py", [])
 _x_mac_door = panel.door_action("chat", "start")
@@ -8654,7 +8650,7 @@ def _x_oneoff(argv) -> str:
     return p.read_text(encoding="utf-8") if ok else "(not a one-off)"
 
 
-_x_o_garmin, _x_o_hb, _x_o_upd, _x_o_pull, _x_o_none = (_x_oneoff(a) for a in (_x_mac["garmin"], _x_mac_hb, _x_mac_upd["argv"], _x_mac_pull["argv"], _x_mac_none))
+_x_o_garmin, _x_o_hb, _x_o_pull, _x_o_none = (_x_oneoff(a) for a in (_x_mac["garmin"], _x_mac_hb, _x_mac_pull["argv"], _x_mac_none))
 _x_head = f'#!/bin/bash\n# a one-off from the panel (engine/panel.py) — it removes itself as it starts\nrm -f -- "$0"\ncd {_xsh.quote(str(panel.ROOT))} || exit 1\n'
 _x_pause = 'read -n1 -r -p "(press any key to close)"\n'
 check("panel on a Mac: a door with its own launcher is `open -a Terminal` on its .command, by its whole path",
@@ -8663,13 +8659,12 @@ check("panel on a Mac: a door with its own launcher is `open -a Terminal` on its
       and _x_mac["parlor"] == ["open", "-a", "Terminal", str(panel.ROOT / "bat" / "parlor.command")]
       and _x_mac["blog"] == ["open", "-a", "Terminal", str(panel.ROOT / "bat" / "blog.command")]  # --deploy is in blog.command itself
       and _x_mac_door["ok"] and _x_launched[-1] == (_x_mac["chat"], panel.ROOT) and "no terminal" not in _x_mac_door["note"], (_x_mac, _x_mac_door))
-check("panel on a Mac: open passes no arguments, so the Garmin login, the heartbeat's minutes, update --check and a pull are each a one-off .command in memory/.pids/ (executable, removing itself, run from the folder)",
+check("panel on a Mac: open passes no arguments, so the Garmin login, the heartbeat's minutes and a pull are each a one-off .command in memory/.pids/ (executable, removing itself, run from the folder)",
       _x_o_garmin == _x_head + "exec bash bat/body.command --login\n"
       and _x_o_hb == _x_head + _xsh.join([sys.executable, "engine/heartbeat.py", "--loop", "45"]) + "\n" + _x_pause
-      and _x_o_upd == _x_head + "exec bash bat/update.command --check\n" and _x_mac_upd["ok"]
       and _x_o_pull == _x_head + "ollama pull gemma4:12b\n" + _x_pause and _x_mac_pull["ok"]
       and _x_o_none == _x_head + _xsh.join([sys.executable, "engine/chat.py"]) + "\n" + _x_pause,
-      (_x_o_garmin, _x_o_hb, _x_o_upd, _x_o_pull, _x_o_none))
+      (_x_o_garmin, _x_o_hb, _x_o_pull, _x_o_none))
 for _xf in doors.pid_file("panel").parent.glob("panel-*.command"):
     _xf.unlink()
 
@@ -8679,7 +8674,6 @@ panel._MAC, panel.TERMINALS = False, _x_p0[3]
 _xshu.which = lambda name, *a, **k: "/usr/bin/gnome-terminal" if name == "gnome-terminal" else None
 _x_lin = {d: panel._bat(*panel.LAUNCHERS[d]) for d in ("chat", "garmin")}
 _x_lin_hb = panel._heartbeat_argv(45)
-_x_lin_upd = panel.update("check")
 _x_lin_door = panel.door_action("chat", "start")
 _xshu.which = lambda name, *a, **k: f"/usr/bin/{name}" if name in ("xterm", "konsole", "x-terminal-emulator") else None
 _x_lin_x = panel._bat(*panel.LAUNCHERS["chat"])
@@ -8688,10 +8682,9 @@ _x_lin_k = panel._bat(*panel.LAUNCHERS["chat"])
 check("panel on Linux: gnome-terminal found — each door its .sh under bash in a terminal (arguments passed on), the heartbeat's loop in bash -c with the pause",
       _x_lin["chat"] == ["gnome-terminal", "--", "bash", str(panel.ROOT / "bat" / "chat.sh")]
       and _x_lin["garmin"] == ["gnome-terminal", "--", "bash", str(panel.ROOT / "bat" / "body.sh"), "--login"]
-      and _x_lin_upd["argv"] == ["gnome-terminal", "--", "bash", str(panel.ROOT / "bat" / "update.sh"), "--check"]
       and _x_lin_hb == ["gnome-terminal", "--", "bash", "-c", f"cd {_xsh.quote(str(panel.ROOT))} && "
                         + _xsh.join([sys.executable, "engine/heartbeat.py", "--loop", "45"]) + '; read -n1 -r -p "(press any key to close)"']
-      and _x_lin_door["ok"] and "no terminal" not in _x_lin_door["note"], (_x_lin, _x_lin_hb, _x_lin_upd))
+      and _x_lin_door["ok"] and "no terminal" not in _x_lin_door["note"], (_x_lin, _x_lin_hb))
 check("panel on Linux: the terminals in their order — x-terminal-emulator first, then gnome-terminal, konsole, xterm",
       _x_lin_x[:2] == ["x-terminal-emulator", "-e"] and _x_lin_k[:2] == ["konsole", "-e"], (_x_lin_x, _x_lin_k))
 _xshu.which = lambda name, *a, **k: None
@@ -8825,7 +8818,7 @@ check("panel: the Mac's ladder — 8 GB the 2B QAT, 16 to 24 GB the 12B, the 31B
       and [panel._recommended(g) for g in (8.0, 16.0, 24.0)] == ["gemma4:e4b-it-qat", "gemma4:12b-it-qat", "gemma4:31b-it-qat"]
       and _x_brain16["vram_gb"] == 16.0 and _x_brain16["unified"] is True and _x_brain16["recommended"] == "gemma4:12b-it-qat"
       and "your Mac has" in panel.PAGE and "on a Mac: the e2b for 8 GB" in panel.PAGE, _x_brain16)
-(panel._launch, panel._WINDOWS, panel._MAC, panel.TERMINALS, panel._ollama, panel._vram_gb, panel.newer_state) = _x_p0
+(panel._launch, panel._WINDOWS, panel._MAC, panel.TERMINALS, panel._ollama, panel._vram_gb) = _x_p0
 check("panel: the device knobs are dropdowns on Senses — VOICE_DEVICE gains mps; PAINTER_DEVICE and MUSIC_EARS_DEVICE are auto, cuda, mps, cpu",
       panel.CHOICES["VOICE_DEVICE"] == ["cpu", "cuda", "mps"] and panel.CHOICES["PAINTER_DEVICE"] == panel.CHOICES["MUSIC_EARS_DEVICE"] == ["auto", "cuda", "mps", "cpu"]
       and {"PAINTER_DEVICE", "MUSIC_EARS_DEVICE", "VOICE_DEVICE"} <= set(panel.TABS["Senses"])
